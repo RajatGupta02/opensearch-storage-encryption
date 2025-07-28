@@ -11,8 +11,8 @@ import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.engine.InternalEngine;
-import org.opensearch.index.store.niofs.CryptoNIOFSDirectory;
 import org.opensearch.index.store.iv.KeyIvResolver;
+import org.opensearch.index.store.niofs.CryptoNIOFSDirectory;
 import org.opensearch.index.translog.CryptoTranslogFactory;
 
 /**
@@ -21,12 +21,11 @@ import org.opensearch.index.translog.CryptoTranslogFactory;
  * between index files and translog files.
  */
 public class CryptoEngineFactory implements EngineFactory {
-    
+
     /**
      * Default constructor.
      */
-    public CryptoEngineFactory() {
-    }
+    public CryptoEngineFactory() {}
 
     /**
      * {@inheritDoc}
@@ -36,10 +35,10 @@ public class CryptoEngineFactory implements EngineFactory {
         try {
             // Get the KeyIvResolver from the crypto directory
             KeyIvResolver keyIvResolver = extractKeyIvResolver(config);
-            
+
             // Create the crypto translog factory using the same KeyIvResolver as the directory
             CryptoTranslogFactory cryptoTranslogFactory = new CryptoTranslogFactory(keyIvResolver);
-            
+
             // Create new engine config by copying all fields from existing config
             // but replace the translog factory with our crypto version
             EngineConfig cryptoConfig = new EngineConfig.Builder()
@@ -74,36 +73,33 @@ public class CryptoEngineFactory implements EngineFactory {
                 .indexReaderWarmer(config.getIndexReaderWarmer())
                 .clusterApplierService(config.getClusterApplierService())
                 .build();
-                
+
             // Return the default engine with crypto-enabled translog
             return new InternalEngine(cryptoConfig);
         } catch (IOException e) {
             throw new RuntimeException("Failed to create crypto engine", e);
         }
     }
-    
+
     /**
      * Extract the KeyIvResolver from the crypto directory.
      * This ensures translog uses the same keys as index files.
      */
     private KeyIvResolver extractKeyIvResolver(EngineConfig config) throws IOException {
         Directory directory = config.getStore().directory();
-        
+
         // The directory should be a crypto directory that contains a KeyIvResolver
         if (directory instanceof CryptoNIOFSDirectory) {
             return ((CryptoNIOFSDirectory) directory).keyIvResolver;
         }
-        
-        // For other crypto directory types, we might need to add similar support
-        // For now, fallback to creating a new resolver (this maintains backward compatibility)
-        CryptoDirectoryFactory directoryFactory = new CryptoDirectoryFactory();
-        return new org.opensearch.index.store.iv.DefaultKeyIvResolver(
-            directory,
-            config.getIndexSettings().getValue(CryptoDirectoryFactory.INDEX_CRYPTO_PROVIDER_SETTING),
-            directoryFactory.getKeyProvider(config.getIndexSettings())
+
+        // If we reach here, it means the CryptoEngineFactory is being used
+        // with a non-crypto directory, which shouldn't happen in normal operation
+        throw new IllegalStateException(
+            "CryptoEngineFactory can only be used with CryptoNIOFSDirectory. " + "Directory type: " + directory.getClass().getSimpleName()
         );
     }
-    
+
     /**
      * Helper method to create a CodecService from existing EngineConfig.
      * Since EngineConfig doesn't expose CodecService directly, we create a new one

@@ -4,20 +4,12 @@
  */
 package org.opensearch.index.translog;
 
-import org.opensearch.index.IndexSettings;
-import org.opensearch.index.seqno.RetentionLeases;
-import org.opensearch.index.translog.CryptoTranslog;
-import org.opensearch.index.translog.Translog;
-import org.opensearch.index.translog.TranslogConfig;
-import org.opensearch.index.translog.TranslogDeletionPolicy;
-import org.opensearch.index.translog.TranslogFactory;
-import org.opensearch.index.store.iv.KeyIvResolver;
-
 import java.io.IOException;
 import java.util.function.BooleanSupplier;
 import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
-import java.util.function.Supplier;
+
+import org.opensearch.index.store.iv.KeyIvResolver;
 
 /**
  * A factory for creating crypto-enabled translogs that use unified key management.

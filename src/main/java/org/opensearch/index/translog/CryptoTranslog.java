@@ -5,7 +5,6 @@
 package org.opensearch.index.translog;
 
 import java.io.IOException;
-import java.util.function.BooleanSupplier;
 import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
 
@@ -52,14 +51,15 @@ public class CryptoTranslog extends LocalTranslog {
         LongSupplier primaryTermSupplier,
         LongConsumer persistedSequenceNumberConsumer,
         KeyIvResolver keyIvResolver
-    ) throws IOException {
+    )
+        throws IOException {
         // super() must be the first statement
         super(config, translogUUID, deletionPolicy, globalCheckpointSupplier, primaryTermSupplier, persistedSequenceNumberConsumer);
-        
+
         // Initialize crypto components after super() completes
         this.keyIvResolver = keyIvResolver;
         this.cryptoChannelFactory = new CryptoChannelFactory(keyIvResolver);
-        
+
         logger.info("CryptoTranslog initialized with AES-CTR encryption for translog: {}", translogUUID);
     }
 
