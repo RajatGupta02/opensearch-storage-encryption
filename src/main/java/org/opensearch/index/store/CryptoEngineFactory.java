@@ -6,13 +6,11 @@ package org.opensearch.index.store;
 
 import java.io.IOException;
 
-import org.apache.lucene.store.Directory;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.store.iv.KeyIvResolver;
-import org.opensearch.index.store.niofs.CryptoNIOFSDirectory;
 import org.opensearch.index.translog.CryptoTranslogFactory;
 
 /**
@@ -33,8 +31,8 @@ public class CryptoEngineFactory implements EngineFactory {
     @Override
     public Engine newReadWriteEngine(EngineConfig config) {
         try {
-            // Get the KeyIvResolver from the crypto directory
-            KeyIvResolver keyIvResolver = extractKeyIvResolver(config);
+            // Create a separate KeyIvResolver for translog encryption
+            KeyIvResolver keyIvResolver = createTranslogKeyIvResolver(config);
 
             // Create the crypto translog factory using the same KeyIvResolver as the directory
             CryptoTranslogFactory cryptoTranslogFactory = new CryptoTranslogFactory(keyIvResolver);
@@ -82,21 +80,25 @@ public class CryptoEngineFactory implements EngineFactory {
     }
 
     /**
-     * Extract the KeyIvResolver from the crypto directory.
-     * This ensures translog uses the same keys as index files.
+     * Create a separate KeyIvResolver for translog encryption.
+     * This approach avoids circular dependencies and complex directory unwrapping.
      */
-    private KeyIvResolver extractKeyIvResolver(EngineConfig config) throws IOException {
-        Directory directory = config.getStore().directory();
+    private KeyIvResolver createTranslogKeyIvResolver(EngineConfig config) throws IOException {
+        // Create a separate key resolver for translog files
+        // This avoids the circular dependency of reading encrypted keys from encrypted directory
 
-        // The directory should be a crypto directory that contains a KeyIvResolver
-        if (directory instanceof CryptoNIOFSDirectory) {
-            return ((CryptoNIOFSDirectory) directory).keyIvResolver;
-        }
+        // Use the translog location for key storage
+        java.nio.file.Path translogPath = config.getTranslogConfig().getTranslogPath();
+        org.apache.lucene.store.Directory keyDirectory = new org.apache.lucene.store.NIOFSDirectory(translogPath);
 
-        // If we reach here, it means the CryptoEngineFactory is being used
-        // with a non-crypto directory, which shouldn't happen in normal operation
-        throw new IllegalStateException(
-            "CryptoEngineFactory can only be used with CryptoNIOFSDirectory. " + "Directory type: " + directory.getClass().getSimpleName()
+        // Create crypto directory factory to get the key provider
+        CryptoDirectoryFactory directoryFactory = new CryptoDirectoryFactory();
+
+        // Create a dedicated key resolver for translog
+        return new org.opensearch.index.store.iv.DefaultKeyIvResolver(
+            keyDirectory,
+            config.getIndexSettings().getValue(CryptoDirectoryFactory.INDEX_CRYPTO_PROVIDER_SETTING),
+            directoryFactory.getKeyProvider(config.getIndexSettings())
         );
     }
 
