@@ -10,13 +10,12 @@ import java.util.Map;
 import java.util.Optional;
 
 import org.opensearch.common.settings.Setting;
-import org.opensearch.plugins.IndexStorePlugin;
-import org.opensearch.plugins.EnginePlugin;
-import org.opensearch.plugins.Plugin;
-import org.opensearch.index.IndexSettings;
 import org.opensearch.index.IndexModule;
+import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
-import org.opensearch.index.translog.CryptoTranslogFactory;
+import org.opensearch.plugins.EnginePlugin;
+import org.opensearch.plugins.IndexStorePlugin;
+import org.opensearch.plugins.Plugin;
 
 /**
  * A plugin that enables index level encryption and decryption.

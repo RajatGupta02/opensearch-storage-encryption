@@ -13,7 +13,6 @@ import java.util.HashSet;
 import java.util.Set;
 
 import org.opensearch.index.store.iv.KeyIvResolver;
-import org.opensearch.index.translog.ChannelFactory;
 
 /**
  * A ChannelFactory implementation that creates FileChannels with transparent
@@ -46,15 +45,15 @@ public class CryptoChannelFactory implements ChannelFactory {
     public FileChannel open(Path path, OpenOption... options) throws IOException {
         // Create the base FileChannel
         FileChannel baseChannel = FileChannel.open(path, options);
-        
+
         // Determine if this file should be encrypted
         String fileName = path.getFileName().toString();
         boolean shouldEncrypt = fileName.endsWith(".tlog");
-        
+
         if (shouldEncrypt) {
             // Wrap with crypto functionality using unified key resolver
             Set<OpenOption> optionsSet = new HashSet<>(Arrays.asList(options));
-            
+
             return new CryptoFileChannelWrapper(baseChannel, keyIvResolver, path, optionsSet);
         } else {
             // Return unwrapped channel for non-encrypted files

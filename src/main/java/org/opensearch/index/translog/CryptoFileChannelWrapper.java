@@ -45,14 +45,14 @@ public class CryptoFileChannelWrapper extends FileChannel {
     private final AtomicLong position;
     private final ReentrantReadWriteLock positionLock;
     private volatile boolean closed = false;
-    
+
     // Thread-local buffer for efficient encryption/decryption
     private static final ThreadLocal<ByteBuffer> TEMP_BUFFER = ThreadLocal.withInitial(() -> ByteBuffer.allocate(16_384));
-    
+
     // Header size constants
     private static final int ESTIMATED_HEADER_SIZE = 100; // Conservative estimate, actual is ~43+ bytes
     private volatile int actualHeaderSize = -1; // Will be determined dynamically
-    
+
     // Constants for better consistency
     private static final int BUFFER_SIZE = 16_384;
 
@@ -65,7 +65,8 @@ public class CryptoFileChannelWrapper extends FileChannel {
      * @param options the file open options (used for logging and debugging)
      * @throws IOException if there is an error setting up the channel
      */
-    public CryptoFileChannelWrapper(FileChannel delegate, KeyIvResolver keyIvResolver, Path path, Set<OpenOption> options) throws IOException {
+    public CryptoFileChannelWrapper(FileChannel delegate, KeyIvResolver keyIvResolver, Path path, Set<OpenOption> options)
+        throws IOException {
         this.delegate = delegate;
         this.keyIvResolver = keyIvResolver;
         this.filePath = path;
@@ -93,7 +94,7 @@ public class CryptoFileChannelWrapper extends FileChannel {
         if (actualHeaderSize > 0) {
             return actualHeaderSize;
         }
-        
+
         // For translog files, we need to read the header to determine its size
         // This is a bit tricky because we need to avoid infinite recursion
         // For now, use a conservative estimate
@@ -106,7 +107,7 @@ public class CryptoFileChannelWrapper extends FileChannel {
             // Non-translog files (.ckp) don't need encryption anyway
             actualHeaderSize = 0;
         }
-        
+
         return actualHeaderSize;
     }
 
@@ -118,11 +119,11 @@ public class CryptoFileChannelWrapper extends FileChannel {
     @Override
     public int read(ByteBuffer dst, long position) throws IOException {
         ensureOpen();
-        
+
         if (dst.remaining() == 0) {
             return 0;
         }
-        
+
         positionLock.writeLock().lock();
         try {
             // Read data from delegate
@@ -130,40 +131,40 @@ public class CryptoFileChannelWrapper extends FileChannel {
             if (bytesRead <= 0) {
                 return bytesRead;
             }
-            
+
             // Update position tracking for non-position-specific reads
             if (position == this.position.get()) {
                 this.position.addAndGet(bytesRead);
             }
-            
+
             // Determine header size
             int headerSize = determineHeaderSize();
-            
+
             // If this read is entirely within the header, no decryption needed
             if (position + bytesRead <= headerSize) {
                 return bytesRead;
             }
-            
+
             // If this read starts within the header but extends beyond it
             if (position < headerSize && position + bytesRead > headerSize) {
                 // Only decrypt the portion beyond the header
                 int headerPortion = (int) (headerSize - position);
                 int encryptedPortion = bytesRead - headerPortion;
-                
+
                 if (encryptedPortion > 0) {
                     // Get the encrypted data portion
                     byte[] encryptedData = new byte[encryptedPortion];
                     int originalPosition = dst.position();
                     dst.position(originalPosition - encryptedPortion);
                     dst.get(encryptedData);
-                    
+
                     // Decrypt the data using unified key resolver
                     try {
                         byte[] key = keyIvResolver.getDataKey().getEncoded();
                         byte[] iv = keyIvResolver.getIvBytes();
                         long encryptedPosition = position + headerPortion;
                         byte[] decryptedData = OpenSslNativeCipher.decrypt(key, iv, encryptedData, encryptedPosition);
-                        
+
                         // Put the decrypted data back into the buffer
                         dst.position(originalPosition - encryptedPortion);
                         dst.put(decryptedData);
@@ -171,10 +172,10 @@ public class CryptoFileChannelWrapper extends FileChannel {
                         throw new IOException("Failed to decrypt data at position " + (position + headerPortion), e);
                     }
                 }
-                
+
                 return bytesRead;
             }
-            
+
             // If this read is entirely beyond the header, decrypt all of it
             if (position >= headerSize) {
                 try {
@@ -183,22 +184,22 @@ public class CryptoFileChannelWrapper extends FileChannel {
                     int originalPosition = dst.position();
                     dst.position(originalPosition - bytesRead);
                     dst.get(encryptedData);
-                    
+
                     // Decrypt the data using unified key resolver
                     byte[] key = keyIvResolver.getDataKey().getEncoded();
                     byte[] iv = keyIvResolver.getIvBytes();
                     byte[] decryptedData = OpenSslNativeCipher.decrypt(key, iv, encryptedData, position);
-                    
+
                     // Put the decrypted data back into the buffer
                     dst.position(originalPosition - bytesRead);
                     dst.put(decryptedData);
-                    
+
                     return bytesRead;
                 } catch (Throwable e) {
                     throw new IOException("Failed to decrypt data at position " + position, e);
                 }
             }
-            
+
             return bytesRead;
         } finally {
             positionLock.writeLock().unlock();
@@ -208,10 +209,10 @@ public class CryptoFileChannelWrapper extends FileChannel {
     @Override
     public long read(ByteBuffer[] dsts, int offset, int length) throws IOException {
         ensureOpen();
-        
+
         long totalBytesRead = 0;
         long currentPosition = position.get();
-        
+
         for (int i = offset; i < offset + length && i < dsts.length; i++) {
             ByteBuffer dst = dsts[i];
             if (dst.remaining() > 0) {
@@ -222,11 +223,11 @@ public class CryptoFileChannelWrapper extends FileChannel {
                 totalBytesRead += bytesRead;
             }
         }
-        
+
         if (totalBytesRead > 0) {
             position.addAndGet(totalBytesRead);
         }
-        
+
         return totalBytesRead;
     }
 
@@ -243,80 +244,80 @@ public class CryptoFileChannelWrapper extends FileChannel {
     @Override
     public int write(ByteBuffer src, long position) throws IOException {
         ensureOpen();
-        
+
         if (src.remaining() == 0) {
             return 0;
         }
-        
+
         positionLock.writeLock().lock();
         try {
             // Determine header size
             int headerSize = determineHeaderSize();
-            
+
             // If this write is entirely within the header, no encryption needed
             if (position + src.remaining() <= headerSize) {
                 return delegate.write(src, position);
             }
-            
+
             // If this write starts within the header but extends beyond it
             if (position < headerSize && position + src.remaining() > headerSize) {
                 // Split the write into header and data portions
                 int headerPortion = (int) (headerSize - position);
                 int dataPortion = src.remaining() - headerPortion;
-                
+
                 // Write header portion without encryption
                 ByteBuffer headerBuffer = ByteBuffer.allocate(headerPortion);
                 src.get(headerBuffer.array());
                 headerBuffer.flip();
                 int headerBytesWritten = delegate.write(headerBuffer, position);
-                
+
                 // Write data portion with encryption
                 if (dataPortion > 0 && headerBytesWritten == headerPortion) {
                     byte[] plainData = new byte[dataPortion];
                     src.get(plainData);
-                    
+
                     // Encrypt the data using unified key resolver
                     try {
                         byte[] key = keyIvResolver.getDataKey().getEncoded();
                         byte[] iv = keyIvResolver.getIvBytes();
                         long encryptedPosition = position + headerPortion;
                         byte[] encryptedData = OpenSslNativeCipher.encrypt(key, iv, plainData, encryptedPosition);
-                        
+
                         // Write the encrypted data
                         ByteBuffer encryptedBuffer = ByteBuffer.wrap(encryptedData);
                         int dataBytesWritten = delegate.write(encryptedBuffer, encryptedPosition);
-                        
+
                         return headerBytesWritten + dataBytesWritten;
                     } catch (Throwable e) {
                         throw new IOException("Failed to encrypt data at position " + (position + headerPortion), e);
                     }
                 }
-                
+
                 return headerBytesWritten;
             }
-            
+
             // If this write is entirely beyond the header, encrypt all of it
             if (position >= headerSize) {
                 try {
                     // Get the data to encrypt
                     byte[] plainData = new byte[src.remaining()];
                     src.get(plainData);
-                    
+
                     // Encrypt the data using unified key resolver
                     byte[] key = keyIvResolver.getDataKey().getEncoded();
                     byte[] iv = keyIvResolver.getIvBytes();
                     byte[] encryptedData = OpenSslNativeCipher.encrypt(key, iv, plainData, position);
-                    
+
                     // Write the encrypted data
                     ByteBuffer encryptedBuffer = ByteBuffer.wrap(encryptedData);
                     int bytesWritten = delegate.write(encryptedBuffer, position);
-                    
+
                     return bytesWritten;
                 } catch (Throwable e) {
                     throw new IOException("Failed to encrypt data at position " + position, e);
                 }
             }
-            
+
             // Fallback to direct write (shouldn't reach here)
             return delegate.write(src, position);
         } finally {
@@ -327,10 +328,10 @@ public class CryptoFileChannelWrapper extends FileChannel {
     @Override
     public long write(ByteBuffer[] srcs, int offset, int length) throws IOException {
         ensureOpen();
-        
+
         long totalBytesWritten = 0;
         long currentPosition = position.get();
-        
+
         for (int i = offset; i < offset + length && i < srcs.length; i++) {
             ByteBuffer src = srcs[i];
             if (src.remaining() > 0) {
@@ -341,11 +342,11 @@ public class CryptoFileChannelWrapper extends FileChannel {
                 totalBytesWritten += bytesWritten;
             }
         }
-        
+
         if (totalBytesWritten > 0) {
             position.addAndGet(totalBytesWritten);
         }
-        
+
         return totalBytesWritten;
     }
 
@@ -389,65 +390,65 @@ public class CryptoFileChannelWrapper extends FileChannel {
     @Override
     public long transferTo(long position, long count, WritableByteChannel target) throws IOException {
         ensureOpen();
-        
+
         // For encrypted files, we need to decrypt data during transfer
         // This is less efficient but ensures data is properly decrypted
         long transferred = 0;
         long remaining = count;
         ByteBuffer buffer = ByteBuffer.allocate(8192);
-        
+
         while (remaining > 0 && transferred < count) {
             buffer.clear();
             int toRead = (int) Math.min(buffer.remaining(), remaining);
             buffer.limit(toRead);
-            
+
             int bytesRead = read(buffer, position + transferred);
             if (bytesRead <= 0) {
                 break;
             }
-            
+
             buffer.flip();
             int bytesWritten = target.write(buffer);
             transferred += bytesWritten;
             remaining -= bytesWritten;
-            
+
             if (bytesWritten < bytesRead) {
                 break;
             }
         }
-        
+
         return transferred;
     }
 
     @Override
     public long transferFrom(ReadableByteChannel src, long position, long count) throws IOException {
         ensureOpen();
-        
+
         // For encrypted files, we need to encrypt data during transfer
         long transferred = 0;
         long remaining = count;
         ByteBuffer buffer = ByteBuffer.allocate(8192);
-        
+
         while (remaining > 0 && transferred < count) {
             buffer.clear();
             int toRead = (int) Math.min(buffer.remaining(), remaining);
             buffer.limit(toRead);
-            
+
             int bytesRead = src.read(buffer);
             if (bytesRead <= 0) {
                 break;
             }
-            
+
             buffer.flip();
             int bytesWritten = write(buffer, position + transferred);
             transferred += bytesWritten;
             remaining -= bytesWritten;
-            
+
             if (bytesWritten < bytesRead) {
                 break;
             }
         }
-        
+
         return transferred;
     }
 
@@ -466,12 +467,12 @@ public class CryptoFileChannelWrapper extends FileChannel {
     @Override
     public MappedByteBuffer map(MapMode mode, long position, long size) throws IOException {
         ensureOpen();
-        
+
         // For encrypted files, we cannot support memory mapping directly
         // because the mapped memory would contain encrypted data
         throw new UnsupportedOperationException(
-            "Memory mapping is not supported for encrypted translog files. " +
-            "Encrypted files require data to be decrypted during read operations."
+            "Memory mapping is not supported for encrypted translog files. "
+                + "Encrypted files require data to be decrypted during read operations."
         );
     }
 
