@@ -29,6 +29,7 @@ import org.opensearch.index.store.iv.KeyIvResolver;
 public class CryptoTranslog extends LocalTranslog {
 
     private final KeyIvResolver keyIvResolver;
+    private final String translogUUID;
     private volatile CryptoChannelFactory cryptoChannelFactory;
 
     /**
@@ -53,12 +54,13 @@ public class CryptoTranslog extends LocalTranslog {
         KeyIvResolver keyIvResolver
     )
         throws IOException {
-        // super() must be the first statement
+
         super(config, translogUUID, deletionPolicy, globalCheckpointSupplier, primaryTermSupplier, persistedSequenceNumberConsumer);
 
         // Initialize crypto components after super() completes
+        this.translogUUID = translogUUID;
         this.keyIvResolver = keyIvResolver;
-        this.cryptoChannelFactory = new CryptoChannelFactory(keyIvResolver);
+        this.cryptoChannelFactory = new CryptoChannelFactory(keyIvResolver, translogUUID);
 
         logger.info("CryptoTranslog initialized with AES-CTR encryption for translog: {}", translogUUID);
     }
@@ -76,8 +78,8 @@ public class CryptoTranslog extends LocalTranslog {
             // Handle case where super() constructor calls this method before we finish initialization
             // This can happen during LocalTranslog constructor when it calls createWriter()
             synchronized (this) {
-                if (cryptoChannelFactory == null && keyIvResolver != null) {
-                    cryptoChannelFactory = new CryptoChannelFactory(keyIvResolver);
+                if (cryptoChannelFactory == null && keyIvResolver != null && translogUUID != null) {
+                    cryptoChannelFactory = new CryptoChannelFactory(keyIvResolver, translogUUID);
                 }
             }
         }
