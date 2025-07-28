@@ -109,10 +109,6 @@ public class CryptoTranslogTests {
     public void testCryptoTranslogCreation() throws IOException {
         // Create a simple deletion policy for testing
         TranslogDeletionPolicy deletionPolicy = new TranslogDeletionPolicy() {
-            public long getMinTranslogGenerationForRecovery() {
-                return 0;
-            }
-
             @Override
             public long getLocalCheckpointOfSafeCommit() {
                 return 0;
@@ -152,7 +148,8 @@ public class CryptoTranslogTests {
         Files.createDirectories(checkpointPath.getParent());
 
         // Create the initial translog file first
-        CryptoChannelFactory channelFactory = new CryptoChannelFactory(keyIvResolver);
+        String testTranslogUUID = "test-translog-uuid";
+        CryptoChannelFactory channelFactory = new CryptoChannelFactory(keyIvResolver, testTranslogUUID);
 
         // Create empty translog file with proper header using OpenSearch's TranslogHeader
         long headerSize;
@@ -218,11 +215,12 @@ public class CryptoTranslogTests {
     @Test
     public void testChannelFactoryFileTypeDetection() throws IOException {
         // Test that the channel factory correctly identifies .tlog vs .ckp files
-        CryptoChannelFactory factory = new CryptoChannelFactory(keyIvResolver);
+        String testTranslogUUID = "test-translog-uuid-for-detection";
+        CryptoChannelFactory factory = new CryptoChannelFactory(keyIvResolver, testTranslogUUID);
 
         assertNotNull("Channel factory should be created", factory);
         assertNotNull("Channel factory should have key IV resolver", factory.getKeyIvResolver());
 
-        logger.info("CryptoChannelFactory configured correctly for file type detection");
+        logger.info("CryptoChannelFactory configured correctly for file type detection with UUID: {}", testTranslogUUID);
     }
 }

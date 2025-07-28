@@ -31,14 +31,20 @@ import org.opensearch.index.store.iv.KeyIvResolver;
 public class CryptoChannelFactory implements ChannelFactory {
 
     private final KeyIvResolver keyIvResolver;
+    private final String translogUUID;
 
     /**
      * Creates a new CryptoChannelFactory.
      *
      * @param keyIvResolver the key and IV resolver for encryption keys (unified with index files)
+     * @param translogUUID the translog UUID for exact header size calculation
      */
-    public CryptoChannelFactory(KeyIvResolver keyIvResolver) {
+    public CryptoChannelFactory(KeyIvResolver keyIvResolver, String translogUUID) {
+        if (translogUUID == null) {
+            throw new IllegalArgumentException("translogUUID is required for exact header size calculation");
+        }
         this.keyIvResolver = keyIvResolver;
+        this.translogUUID = translogUUID;
     }
 
     @Override
@@ -51,10 +57,10 @@ public class CryptoChannelFactory implements ChannelFactory {
         boolean shouldEncrypt = fileName.endsWith(".tlog");
 
         if (shouldEncrypt) {
-            // Wrap with crypto functionality using unified key resolver
+            // Wrap with crypto functionality using unified key resolver and exact UUID
             Set<OpenOption> optionsSet = new HashSet<>(Arrays.asList(options));
 
-            return new CryptoFileChannelWrapper(baseChannel, keyIvResolver, path, optionsSet);
+            return new CryptoFileChannelWrapper(baseChannel, keyIvResolver, path, optionsSet, translogUUID);
         } else {
             // Return unwrapped channel for non-encrypted files
             return baseChannel;

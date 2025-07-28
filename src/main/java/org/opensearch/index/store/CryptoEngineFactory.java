@@ -15,8 +15,6 @@ import org.opensearch.index.translog.CryptoTranslogFactory;
 
 /**
  * A factory that creates engines with crypto-enabled translogs for cryptofs indices.
- * Updated to use unified KeyIvResolver approach for consistent key management
- * between index files and translog files.
  */
 public class CryptoEngineFactory implements EngineFactory {
 
@@ -81,11 +79,9 @@ public class CryptoEngineFactory implements EngineFactory {
 
     /**
      * Create a separate KeyIvResolver for translog encryption.
-     * This approach avoids circular dependencies and complex directory unwrapping.
      */
     private KeyIvResolver createTranslogKeyIvResolver(EngineConfig config) throws IOException {
         // Create a separate key resolver for translog files
-        // This avoids the circular dependency of reading encrypted keys from encrypted directory
 
         // Use the translog location for key storage
         java.nio.file.Path translogPath = config.getTranslogConfig().getTranslogPath();

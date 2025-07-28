@@ -19,18 +19,14 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.index.store.cipher.OpenSslNativeCipher;
 import org.opensearch.index.store.iv.KeyIvResolver;
 
 /**
  * A FileChannel wrapper that provides transparent AES-CTR encryption/decryption
  * for translog files with header-aware encryption.
- *
- * Key features:
- * - Leaves translog header unencrypted (first ~43+ bytes) for OpenSearch compatibility
- * - Encrypts only the data portion after the header
- * - Thread-safe with proper position tracking
- * - Unified key management with index files
  *
  * This approach ensures OpenSearch can read translog metadata while keeping
  * the actual translog operations encrypted.
@@ -39,9 +35,12 @@ import org.opensearch.index.store.iv.KeyIvResolver;
  */
 public class CryptoFileChannelWrapper extends FileChannel {
 
+    private static final Logger logger = LogManager.getLogger(CryptoFileChannelWrapper.class);
+
     private final FileChannel delegate;
     private final KeyIvResolver keyIvResolver;
     private final Path filePath;
+    private final String translogUUID;
     private final AtomicLong position;
     private final ReentrantReadWriteLock positionLock;
     private volatile boolean closed = false;
@@ -49,9 +48,8 @@ public class CryptoFileChannelWrapper extends FileChannel {
     // Thread-local buffer for efficient encryption/decryption
     private static final ThreadLocal<ByteBuffer> TEMP_BUFFER = ThreadLocal.withInitial(() -> ByteBuffer.allocate(16_384));
 
-    // Header size constants
-    private static final int ESTIMATED_HEADER_SIZE = 100; // Conservative estimate, actual is ~43+ bytes
-    private volatile int actualHeaderSize = -1; // Will be determined dynamically
+    // Header size - calculated exactly using TranslogHeader.headerSizeInBytes()
+    private volatile int actualHeaderSize = -1;
 
     // Constants for better consistency
     private static final int BUFFER_SIZE = 16_384;
@@ -63,49 +61,45 @@ public class CryptoFileChannelWrapper extends FileChannel {
      * @param keyIvResolver the key and IV resolver for encryption (unified with index files)
      * @param path the file path (used for logging and debugging)
      * @param options the file open options (used for logging and debugging)
+     * @param translogUUID the translog UUID for exact header size calculation
      * @throws IOException if there is an error setting up the channel
      */
-    public CryptoFileChannelWrapper(FileChannel delegate, KeyIvResolver keyIvResolver, Path path, Set<OpenOption> options)
+    public CryptoFileChannelWrapper(
+        FileChannel delegate,
+        KeyIvResolver keyIvResolver,
+        Path path,
+        Set<OpenOption> options,
+        String translogUUID
+    )
         throws IOException {
+        if (translogUUID == null) {
+            throw new IllegalArgumentException("translogUUID is required for exact header size calculation");
+        }
         this.delegate = delegate;
         this.keyIvResolver = keyIvResolver;
         this.filePath = path;
+        this.translogUUID = translogUUID;
         this.position = new AtomicLong(delegate.position());
         this.positionLock = new ReentrantReadWriteLock();
     }
 
     /**
-     * Determines if the given position is within the header area.
-     * Header area should not be encrypted.
-     */
-    private boolean isHeaderPosition(long pos) {
-        if (actualHeaderSize > 0) {
-            return pos < actualHeaderSize;
-        }
-        // Use conservative estimate if actual size not yet determined
-        return pos < ESTIMATED_HEADER_SIZE;
-    }
-
-    /**
-     * Determines the actual header size by examining the file name.
-     * For translog files, we need to calculate the header size based on the translog UUID.
+     * Determines the exact header size using OpenSearch's TranslogHeader.headerSizeInBytes() method.
+     * This eliminates ALL file reading and estimation - uses pure calculation based on UUID.
      */
     private int determineHeaderSize() {
         if (actualHeaderSize > 0) {
             return actualHeaderSize;
         }
 
-        // For translog files, we need to read the header to determine its size
-        // This is a bit tricky because we need to avoid infinite recursion
-        // For now, use a conservative estimate
         String fileName = filePath.getFileName().toString();
         if (fileName.endsWith(".tlog")) {
-            // Translog files have variable header sizes, but typically around 43-60 bytes
-            // We'll use a conservative estimate and refine this later
-            actualHeaderSize = 60;
+            actualHeaderSize = TranslogHeader.headerSizeInBytes(translogUUID);
+            logger.debug("Calculated exact header size: {} bytes for {} with UUID: {}", actualHeaderSize, filePath, translogUUID);
         } else {
             // Non-translog files (.ckp) don't need encryption anyway
             actualHeaderSize = 0;
+            logger.debug("Non-translog file {}, header size: 0", filePath);
         }
 
         return actualHeaderSize;
@@ -501,6 +495,7 @@ public class CryptoFileChannelWrapper extends FileChannel {
 
     /**
      * Gets the determined header size for this translog file.
+     * Uses exact calculation based on translogUUID - no exceptions possible.
      *
      * @return the header size in bytes
      */
