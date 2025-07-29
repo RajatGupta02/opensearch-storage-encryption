@@ -6,6 +6,8 @@ package org.opensearch.index.store;
 
 import java.io.IOException;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineFactory;
@@ -18,6 +20,8 @@ import org.opensearch.index.translog.CryptoTranslogFactory;
  */
 public class CryptoEngineFactory implements EngineFactory {
 
+    private static final Logger logger = LogManager.getLogger(CryptoEngineFactory.class);
+
     /**
      * Default constructor.
      */
@@ -28,12 +32,16 @@ public class CryptoEngineFactory implements EngineFactory {
      */
     @Override
     public Engine newReadWriteEngine(EngineConfig config) {
+        logger.error("CRYPTO DEBUG: CryptoEngineFactory.newReadWriteEngine() called for shard: {}", config.getShardId());
+
         try {
             // Create a separate KeyIvResolver for translog encryption
             KeyIvResolver keyIvResolver = createTranslogKeyIvResolver(config);
 
             // Create the crypto translog factory using the same KeyIvResolver as the directory
             CryptoTranslogFactory cryptoTranslogFactory = new CryptoTranslogFactory(keyIvResolver);
+
+            logger.error("CRYPTO DEBUG: Created CryptoTranslogFactory - hashCode={}", cryptoTranslogFactory.hashCode());
 
             // Create new engine config by copying all fields from existing config
             // but replace the translog factory with our crypto version
