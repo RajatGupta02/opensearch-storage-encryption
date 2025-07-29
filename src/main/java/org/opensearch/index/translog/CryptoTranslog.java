@@ -168,6 +168,10 @@ public class CryptoTranslog extends LocalTranslog {
      */
     @Override
     public ChannelFactory getChannelFactory() {
+
+        System.err.println("🚨🚨🚨 CRYPTO CRITICAL: getChannelFactory() METHOD CALLED 🚨🚨🚨");
+        System.err.flush();
+
         // CRITICAL DEBUG: Log every call to getChannelFactory with stack trace
         StackTraceElement[] stackTrace = Thread.currentThread().getStackTrace();
         StringBuilder sb = new StringBuilder();
