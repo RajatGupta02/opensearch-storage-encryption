@@ -71,19 +71,75 @@ public class CryptoTranslog extends LocalTranslog {
      * Uses lazy initialization to handle constructor ordering issues.
      *
      * @return the crypto channel factory
+     * @throws IllegalStateException if crypto channel factory cannot be initialized (SECURITY: never fall back to plain text)
      */
     @Override
     public ChannelFactory getChannelFactory() {
+        // CRITICAL DEBUG: Log every call to getChannelFactory
+        logger
+            .error(
+                "CRYPTO DEBUG: getChannelFactory() called - cryptoChannelFactory={}, keyIvResolver={}, translogUUID={}",
+                (cryptoChannelFactory != null ? "INITIALIZED" : "NULL"),
+                (keyIvResolver != null ? "AVAILABLE" : "NULL"),
+                translogUUID
+            );
+
         if (cryptoChannelFactory == null) {
             // Handle case where super() constructor calls this method before we finish initialization
             // This can happen during LocalTranslog constructor when it calls createWriter()
             synchronized (this) {
-                if (cryptoChannelFactory == null && keyIvResolver != null && translogUUID != null) {
-                    cryptoChannelFactory = new CryptoChannelFactory(keyIvResolver, translogUUID);
+                if (cryptoChannelFactory == null) {
+                    // CRITICAL DEBUG: Log initialization attempt
+                    logger
+                        .error(
+                            "CRYPTO DEBUG: Attempting to initialize CryptoChannelFactory - keyIvResolver={}, translogUUID={}",
+                            (keyIvResolver != null ? "AVAILABLE" : "NULL"),
+                            translogUUID
+                        );
+
+                    if (keyIvResolver != null && translogUUID != null) {
+                        try {
+                            cryptoChannelFactory = new CryptoChannelFactory(keyIvResolver, translogUUID);
+                            logger.error("CRYPTO DEBUG: CryptoChannelFactory initialized successfully");
+                        } catch (Exception e) {
+                            logger.error("CRYPTO DEBUG: FAILED to initialize CryptoChannelFactory: {}", e.getMessage(), e);
+                            // SECURITY: Never fall back to plain text - fail fast!
+                            throw new IllegalStateException(
+                                "CRITICAL SECURITY ERROR: Failed to initialize crypto channel factory for translog encryption. "
+                                    + "Cannot proceed with plain text translog operations!",
+                                e
+                            );
+                        }
+                    } else {
+                        // SECURITY: Never fall back to plain text - fail fast!
+                        logger
+                            .error(
+                                "CRYPTO DEBUG: MISSING REQUIRED COMPONENTS - keyIvResolver={}, translogUUID={}",
+                                keyIvResolver,
+                                translogUUID
+                            );
+                        throw new IllegalStateException(
+                            "CRITICAL SECURITY ERROR: Cannot initialize crypto channel factory - missing keyIvResolver or translogUUID. "
+                                + "Required for translog encryption. keyIvResolver="
+                                + keyIvResolver
+                                + ", translogUUID="
+                                + translogUUID
+                        );
+                    }
                 }
             }
         }
-        return cryptoChannelFactory != null ? cryptoChannelFactory : super.getChannelFactory();
+
+        // SECURITY: NEVER return super.getChannelFactory() - this would bypass encryption!
+        if (cryptoChannelFactory == null) {
+            throw new IllegalStateException(
+                "CRITICAL SECURITY ERROR: CryptoChannelFactory is null after initialization attempt. "
+                    + "Cannot proceed with unencrypted translog operations!"
+            );
+        }
+
+        logger.error("CRYPTO DEBUG: Returning CryptoChannelFactory - encryption enabled");
+        return cryptoChannelFactory;
     }
 
     /**
