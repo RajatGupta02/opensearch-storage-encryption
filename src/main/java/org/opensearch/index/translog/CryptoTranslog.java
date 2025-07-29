@@ -271,6 +271,70 @@ public class CryptoTranslog extends LocalTranslog {
     }
 
     /**
+     * Override createWriter to ensure crypto channel factory is used.
+     * This fixes the issue where getChannelFactory() wasn't being called during constructor.
+     */
+    @Override
+    TranslogWriter createWriter(long fileGeneration) throws IOException {
+        logger.error("CRYPTO DEBUG: CryptoTranslog.createWriter(fileGeneration={}) called", fileGeneration);
+        return createWriter(fileGeneration, getMinFileGeneration(), globalCheckpointSupplier.getAsLong(), persistedSequenceNumberConsumer);
+    }
+
+    /**
+     * Override createWriter to ensure crypto channel factory is used directly.
+     * This bypasses the getChannelFactory() method call during super() constructor.
+     */
+    @Override
+    TranslogWriter createWriter(
+        long fileGeneration,
+        long initialMinTranslogGen,
+        long initialGlobalCheckpoint,
+        LongConsumer persistedSequenceNumberConsumer
+    ) throws IOException {
+        logger
+            .error(
+                "CRYPTO DEBUG: CryptoTranslog.createWriter(gen={}, minGen={}, checkpoint={}) called",
+                fileGeneration,
+                initialMinTranslogGen,
+                initialGlobalCheckpoint
+            );
+
+        // Ensure crypto channel factory is available
+        ChannelFactory channelFactory = getChannelFactory();
+
+        logger.error("CRYPTO DEBUG: Using channelFactory={} for createWriter", channelFactory.getClass().getSimpleName());
+
+        final TranslogWriter newWriter;
+        try {
+            newWriter = TranslogWriter
+                .create(
+                    shardId,
+                    translogUUID,
+                    fileGeneration,
+                    location.resolve(getFilename(fileGeneration)),
+                    channelFactory, // Use our crypto channel factory directly
+                    config.getBufferSize(),
+                    initialMinTranslogGen,
+                    initialGlobalCheckpoint,
+                    globalCheckpointSupplier,
+                    this::getMinFileGeneration,
+                    primaryTermSupplier.getAsLong(),
+                    tragedy,
+                    persistedSequenceNumberConsumer,
+                    bigArrays,
+                    indexSettings.isAssignedOnRemoteNode()
+                );
+
+            logger.error("CRYPTO DEBUG: Successfully created TranslogWriter with crypto channels for generation {}", fileGeneration);
+
+        } catch (final IOException e) {
+            logger.error("CRYPTO DEBUG: Failed to create TranslogWriter with crypto channels: {}", e.getMessage(), e);
+            throw new TranslogException(shardId, "failed to create new translog file with encryption", e);
+        }
+        return newWriter;
+    }
+
+    /**
      * Gets the key IV resolver used for encryption.
      *
      * @return the key IV resolver
