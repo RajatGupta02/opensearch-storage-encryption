@@ -62,6 +62,14 @@ public class CryptoTranslog extends LocalTranslog {
         this.keyIvResolver = keyIvResolver;
         this.cryptoChannelFactory = new CryptoChannelFactory(keyIvResolver, translogUUID);
 
+        logger
+            .error(
+                "CRYPTO DEBUG: CryptoTranslog CONSTRUCTOR completed - translogUUID={}, keyIvResolver={}, cryptoChannelFactory={}, hashCode={}",
+                translogUUID,
+                (keyIvResolver != null ? "AVAILABLE" : "NULL"),
+                (cryptoChannelFactory != null ? "INITIALIZED" : "NULL"),
+                this.hashCode()
+            );
         logger.info("CryptoTranslog initialized with AES-CTR encryption for translog: {}", translogUUID);
     }
 
