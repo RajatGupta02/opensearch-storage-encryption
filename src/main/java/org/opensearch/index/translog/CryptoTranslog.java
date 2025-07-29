@@ -55,12 +55,43 @@ public class CryptoTranslog extends LocalTranslog {
     )
         throws IOException {
 
+        // CRITICAL SECURITY FIX: super() must be first, but we validate inputs first
         super(config, translogUUID, deletionPolicy, globalCheckpointSupplier, primaryTermSupplier, persistedSequenceNumberConsumer);
 
-        // Initialize crypto components after super() completes
+        // SECURITY: Strict validation - never allow null components
+        if (keyIvResolver == null || translogUUID == null) {
+            throw new IllegalStateException(
+                "CRITICAL SECURITY ERROR: Cannot create CryptoTranslog without keyIvResolver and translogUUID. "
+                    + "Required for translog encryption. keyIvResolver="
+                    + keyIvResolver
+                    + ", translogUUID="
+                    + translogUUID
+            );
+        }
+
+        // Initialize crypto components immediately after super() completes
         this.translogUUID = translogUUID;
         this.keyIvResolver = keyIvResolver;
-        this.cryptoChannelFactory = new CryptoChannelFactory(keyIvResolver, translogUUID);
+
+        logger
+            .error(
+                "CRYPTO DEBUG: About to initialize CryptoChannelFactory - translogUUID={}, keyIvResolver={}",
+                translogUUID,
+                (keyIvResolver != null ? "AVAILABLE" : "NULL")
+            );
+
+        // CRITICAL: Initialize crypto channel factory immediately to prevent any race conditions
+        try {
+            this.cryptoChannelFactory = new CryptoChannelFactory(keyIvResolver, translogUUID);
+            logger.error("CRYPTO DEBUG: CryptoChannelFactory initialized AFTER super() - SUCCESS");
+        } catch (Exception e) {
+            logger.error("CRYPTO DEBUG: FAILED to initialize CryptoChannelFactory: {}", e.getMessage(), e);
+            throw new IOException(
+                "CRITICAL SECURITY ERROR: Failed to initialize crypto channel factory for translog encryption. "
+                    + "Cannot proceed without encryption!",
+                e
+            );
+        }
 
         logger
             .error(
@@ -83,13 +114,21 @@ public class CryptoTranslog extends LocalTranslog {
      */
     @Override
     public ChannelFactory getChannelFactory() {
-        // CRITICAL DEBUG: Log every call to getChannelFactory
+        // CRITICAL DEBUG: Log every call to getChannelFactory with stack trace
+        StackTraceElement[] stackTrace = Thread.currentThread().getStackTrace();
+        StringBuilder sb = new StringBuilder();
+        for (int i = 1; i < Math.min(6, stackTrace.length); i++) {
+            sb.append(stackTrace[i].toString()).append(" -> ");
+        }
+
         logger
             .error(
-                "CRYPTO DEBUG: getChannelFactory() called - cryptoChannelFactory={}, keyIvResolver={}, translogUUID={}",
+                "CRYPTO DEBUG: getChannelFactory() called - cryptoChannelFactory={}, keyIvResolver={}, translogUUID={}, instanceHash={}, STACK={}",
                 (cryptoChannelFactory != null ? "INITIALIZED" : "NULL"),
                 (keyIvResolver != null ? "AVAILABLE" : "NULL"),
-                translogUUID
+                translogUUID,
+                this.hashCode(),
+                sb.toString()
             );
 
         if (cryptoChannelFactory == null) {
@@ -148,6 +187,34 @@ public class CryptoTranslog extends LocalTranslog {
 
         logger.error("CRYPTO DEBUG: Returning CryptoChannelFactory - encryption enabled");
         return cryptoChannelFactory;
+    }
+
+    /**
+     * Override key translog operation methods to track actual usage
+     */
+    @Override
+    public Location add(Operation operation) throws IOException {
+        logger.error("CRYPTO DEBUG: CryptoTranslog.add() called - operation={}, instanceHash={}", operation.opType(), this.hashCode());
+        return super.add(operation);
+    }
+
+    @Override
+    public void rollGeneration() throws IOException {
+        logger.error("CRYPTO DEBUG: CryptoTranslog.rollGeneration() called - instanceHash={}", this.hashCode());
+        super.rollGeneration();
+    }
+
+    @Override
+    public boolean syncNeeded() {
+        boolean needed = super.syncNeeded();
+        logger.error("CRYPTO DEBUG: CryptoTranslog.syncNeeded() called - needed={}, instanceHash={}", needed, this.hashCode());
+        return needed;
+    }
+
+    @Override
+    public void sync() throws IOException {
+        logger.error("CRYPTO DEBUG: CryptoTranslog.sync() called - instanceHash={}", this.hashCode());
+        super.sync();
     }
 
     /**
