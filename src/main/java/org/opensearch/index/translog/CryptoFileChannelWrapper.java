@@ -248,13 +248,27 @@ public class CryptoFileChannelWrapper extends FileChannel {
             // Determine header size
             int headerSize = determineHeaderSize();
 
+            // CRITICAL DEBUG: Log every write operation
+            logger
+                .error(
+                    "CRYPTO DEBUG: write() called - position={}, dataSize={}, headerSize={}, filePath={}",
+                    position,
+                    src.remaining(),
+                    headerSize,
+                    filePath
+                );
+
             // If this write is entirely within the header, no encryption needed
             if (position + src.remaining() <= headerSize) {
+                logger.error("CRYPTO DEBUG: Writing to header area - position={}, size={}, no encryption", position, src.remaining());
                 return delegate.write(src, position);
             }
 
             // If this write starts within the header but extends beyond it
             if (position < headerSize && position + src.remaining() > headerSize) {
+                logger
+                    .error("CRYPTO DEBUG: Write spans header boundary - position={}, headerSize={}, splitting write", position, headerSize);
+
                 // Split the write into header and data portions
                 int headerPortion = (int) (headerSize - position);
                 int dataPortion = src.remaining() - headerPortion;
@@ -270,6 +284,18 @@ public class CryptoFileChannelWrapper extends FileChannel {
                     byte[] plainData = new byte[dataPortion];
                     src.get(plainData);
 
+                    logger.error("CRYPTO DEBUG: Encrypting data portion - size={}, position={}", dataPortion, position + headerPortion);
+
+                    // LOG PLAINTEXT DATA BEFORE ENCRYPTION
+                    logger
+                        .error(
+                            "CRYPTO DEBUG: PLAINTEXT DATA (boundary span) - position={}, size={}, preview=[{}], hex=[{}]",
+                            position + headerPortion,
+                            plainData.length,
+                            bytesToSafeString(plainData, 100),
+                            bytesToHex(plainData, 0, Math.min(50, plainData.length))
+                        );
+
                     // Encrypt the data using unified key resolver
                     try {
                         byte[] key = keyIvResolver.getDataKey().getEncoded();
@@ -277,12 +303,30 @@ public class CryptoFileChannelWrapper extends FileChannel {
                         long encryptedPosition = position + headerPortion;
                         byte[] encryptedData = OpenSslNativeCipher.encrypt(key, iv, plainData, encryptedPosition);
 
+                        // LOG ENCRYPTED DATA AFTER ENCRYPTION
+                        logger
+                            .error(
+                                "CRYPTO DEBUG: ENCRYPTED DATA (boundary span) - position={}, plainSize={}, encryptedSize={}, encryptedHex=[{}]",
+                                encryptedPosition,
+                                plainData.length,
+                                encryptedData.length,
+                                bytesToHex(encryptedData, 0, Math.min(50, encryptedData.length))
+                            );
+
+                        logger
+                            .error(
+                                "CRYPTO DEBUG: Encryption successful - plainSize={}, encryptedSize={}",
+                                plainData.length,
+                                encryptedData.length
+                            );
+
                         // Write the encrypted data
                         ByteBuffer encryptedBuffer = ByteBuffer.wrap(encryptedData);
                         int dataBytesWritten = delegate.write(encryptedBuffer, encryptedPosition);
 
                         return headerBytesWritten + dataBytesWritten;
                     } catch (Throwable e) {
+                        logger.error("CRYPTO DEBUG: Encryption FAILED - error={}", e.getMessage(), e);
                         throw new IOException("Failed to encrypt data at position " + (position + headerPortion), e);
                     }
                 }
@@ -292,27 +336,67 @@ public class CryptoFileChannelWrapper extends FileChannel {
 
             // If this write is entirely beyond the header, encrypt all of it
             if (position >= headerSize) {
+                logger.error("CRYPTO DEBUG: Writing beyond header - position={}, size={}, encrypting all data", position, src.remaining());
+
                 try {
                     // Get the data to encrypt
                     byte[] plainData = new byte[src.remaining()];
                     src.get(plainData);
+
+                    logger.error("CRYPTO DEBUG: About to encrypt data - size={}, position={}", plainData.length, position);
+
+                    // LOG PLAINTEXT DATA BEFORE ENCRYPTION
+                    logger
+                        .error(
+                            "CRYPTO DEBUG: PLAINTEXT DATA (beyond header) - position={}, size={}, preview=[{}], hex=[{}]",
+                            position,
+                            plainData.length,
+                            bytesToSafeString(plainData, 100),
+                            bytesToHex(plainData, 0, Math.min(50, plainData.length))
+                        );
 
                     // Encrypt the data using unified key resolver
                     byte[] key = keyIvResolver.getDataKey().getEncoded();
                     byte[] iv = keyIvResolver.getIvBytes();
                     byte[] encryptedData = OpenSslNativeCipher.encrypt(key, iv, plainData, position);
 
+                    // LOG ENCRYPTED DATA AFTER ENCRYPTION
+                    logger
+                        .error(
+                            "CRYPTO DEBUG: ENCRYPTED DATA (beyond header) - position={}, plainSize={}, encryptedSize={}, encryptedHex=[{}]",
+                            position,
+                            plainData.length,
+                            encryptedData.length,
+                            bytesToHex(encryptedData, 0, Math.min(50, encryptedData.length))
+                        );
+
+                    logger
+                        .error(
+                            "CRYPTO DEBUG: Encryption successful - plainSize={}, encryptedSize={}",
+                            plainData.length,
+                            encryptedData.length
+                        );
+
                     // Write the encrypted data
                     ByteBuffer encryptedBuffer = ByteBuffer.wrap(encryptedData);
                     int bytesWritten = delegate.write(encryptedBuffer, position);
 
+                    logger.error("CRYPTO DEBUG: Encrypted data written - bytesWritten={}", bytesWritten);
                     return bytesWritten;
                 } catch (Throwable e) {
+                    logger.error("CRYPTO DEBUG: Encryption FAILED - error={}", e.getMessage(), e);
                     throw new IOException("Failed to encrypt data at position " + position, e);
                 }
             }
 
-            // Fallback to direct write (shouldn't reach here)
+            // Fallback to direct write (THIS SHOULD NEVER HAPPEN!)
+            logger
+                .error(
+                    "CRYPTO DEBUG: FALLBACK WRITE - THIS IS A BUG! position={}, headerSize={}, size={}",
+                    position,
+                    headerSize,
+                    src.remaining()
+                );
             return delegate.write(src, position);
         } finally {
             positionLock.writeLock().unlock();
@@ -501,5 +585,47 @@ public class CryptoFileChannelWrapper extends FileChannel {
      */
     public int getHeaderSize() {
         return determineHeaderSize();
+    }
+
+    /**
+     * Helper method to convert bytes to hex string for debug logging.
+     */
+    private static String bytesToHex(byte[] bytes, int offset, int length) {
+        if (bytes == null || bytes.length == 0) {
+            return "";
+        }
+        StringBuilder hexString = new StringBuilder();
+        int end = Math.min(offset + length, bytes.length);
+        for (int i = offset; i < end; i++) {
+            String hex = Integer.toHexString(0xFF & bytes[i]);
+            if (hex.length() == 1) {
+                hexString.append('0');
+            }
+            hexString.append(hex);
+        }
+        return hexString.toString();
+    }
+
+    /**
+     * Helper method to safely convert bytes to string for debug logging.
+     */
+    private static String bytesToSafeString(byte[] bytes, int maxLength) {
+        if (bytes == null || bytes.length == 0) {
+            return "";
+        }
+        int length = Math.min(maxLength, bytes.length);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < length; i++) {
+            byte b = bytes[i];
+            if (b >= 32 && b <= 126) { // Printable ASCII
+                sb.append((char) b);
+            } else {
+                sb.append("\\x").append(String.format("%02x", b & 0xFF));
+            }
+        }
+        if (bytes.length > maxLength) {
+            sb.append("...[truncated]");
+        }
+        return sb.toString();
     }
 }
