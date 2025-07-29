@@ -8,6 +8,8 @@ import java.io.IOException;
 import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.index.store.iv.KeyIvResolver;
 
 /**
@@ -27,6 +29,8 @@ import org.opensearch.index.store.iv.KeyIvResolver;
  * @opensearch.internal
  */
 public class CryptoTranslog extends LocalTranslog {
+
+    private static final Logger logger = LogManager.getLogger(CryptoTranslog.class);
 
     private final KeyIvResolver keyIvResolver;
     private final String translogUUID;
@@ -76,21 +80,24 @@ public class CryptoTranslog extends LocalTranslog {
         CONSTRUCTOR_KEY_IV_RESOLVER.set(keyIvResolver);
         CONSTRUCTOR_TRANSLOG_UUID.set(translogUUID);
 
-        try {
-            return new CryptoTranslog(
-                config,
-                translogUUID,
-                deletionPolicy,
-                globalCheckpointSupplier,
-                primaryTermSupplier,
-                persistedSequenceNumberConsumer,
-                keyIvResolver
+        logger
+            .error(
+                "CRYPTO DEBUG: Static factory method - ThreadLocal values set - keyIvResolver={}, translogUUID={}",
+                (keyIvResolver != null ? "AVAILABLE" : "NULL"),
+                translogUUID
             );
-        } finally {
-            // CRITICAL: Always clean up ThreadLocal to prevent memory leaks
-            CONSTRUCTOR_KEY_IV_RESOLVER.remove();
-            CONSTRUCTOR_TRANSLOG_UUID.remove();
-        }
+
+        // CRITICAL: Don't clean up ThreadLocal here - constructor needs them during super() call
+        // Cleanup happens at the end of constructor instead
+        return new CryptoTranslog(
+            config,
+            translogUUID,
+            deletionPolicy,
+            globalCheckpointSupplier,
+            primaryTermSupplier,
+            persistedSequenceNumberConsumer,
+            keyIvResolver
+        );
     }
 
     public CryptoTranslog(
@@ -140,6 +147,15 @@ public class CryptoTranslog extends LocalTranslog {
                 this.hashCode()
             );
         logger.info("CryptoTranslog initialized with AES-CTR encryption for translog: {}", translogUUID);
+
+        // CRITICAL: Clean up ThreadLocal to prevent memory leaks after constructor completes
+        try {
+            CONSTRUCTOR_KEY_IV_RESOLVER.remove();
+            CONSTRUCTOR_TRANSLOG_UUID.remove();
+            logger.error("CRYPTO DEBUG: ThreadLocal values cleaned up in constructor");
+        } catch (Exception e) {
+            logger.error("CRYPTO DEBUG: Error cleaning up ThreadLocal: {}", e.getMessage());
+        }
     }
 
     /**
