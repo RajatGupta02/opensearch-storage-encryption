@@ -32,6 +32,10 @@ public class CryptoTranslog extends LocalTranslog {
     private final String translogUUID;
     private volatile CryptoChannelFactory cryptoChannelFactory;
 
+    // CONSTRUCTOR PARAMETERS: Store these to handle race condition during super() call
+    private static final ThreadLocal<KeyIvResolver> CONSTRUCTOR_KEY_IV_RESOLVER = new ThreadLocal<>();
+    private static final ThreadLocal<String> CONSTRUCTOR_TRANSLOG_UUID = new ThreadLocal<>();
+
     /**
      * Creates a new CryptoTranslog with AES-CTR encryption.
      *
@@ -44,6 +48,51 @@ public class CryptoTranslog extends LocalTranslog {
      * @param keyIvResolver the key and IV resolver for encryption (unified with index files)
      * @throws IOException if translog creation fails
      */
+    /**
+     * Static factory method to create CryptoTranslog with proper ThreadLocal setup
+     */
+    public static CryptoTranslog create(
+        TranslogConfig config,
+        String translogUUID,
+        TranslogDeletionPolicy deletionPolicy,
+        LongSupplier globalCheckpointSupplier,
+        LongSupplier primaryTermSupplier,
+        LongConsumer persistedSequenceNumberConsumer,
+        KeyIvResolver keyIvResolver
+    ) throws IOException {
+
+        // SECURITY: Strict validation - never allow null components
+        if (keyIvResolver == null || translogUUID == null) {
+            throw new IllegalArgumentException(
+                "CRITICAL SECURITY ERROR: Cannot create CryptoTranslog without keyIvResolver and translogUUID. "
+                    + "Required for translog encryption. keyIvResolver="
+                    + keyIvResolver
+                    + ", translogUUID="
+                    + translogUUID
+            );
+        }
+
+        // Store parameters in ThreadLocal so getChannelFactory() can access them during constructor
+        CONSTRUCTOR_KEY_IV_RESOLVER.set(keyIvResolver);
+        CONSTRUCTOR_TRANSLOG_UUID.set(translogUUID);
+
+        try {
+            return new CryptoTranslog(
+                config,
+                translogUUID,
+                deletionPolicy,
+                globalCheckpointSupplier,
+                primaryTermSupplier,
+                persistedSequenceNumberConsumer,
+                keyIvResolver
+            );
+        } finally {
+            // CRITICAL: Always clean up ThreadLocal to prevent memory leaks
+            CONSTRUCTOR_KEY_IV_RESOLVER.remove();
+            CONSTRUCTOR_TRANSLOG_UUID.remove();
+        }
+    }
+
     public CryptoTranslog(
         TranslogConfig config,
         String translogUUID,
@@ -55,21 +104,10 @@ public class CryptoTranslog extends LocalTranslog {
     )
         throws IOException {
 
-        // CRITICAL SECURITY FIX: super() must be first, but we validate inputs first
+        // CRITICAL: super() must be first - getChannelFactory() will use ThreadLocal if needed
         super(config, translogUUID, deletionPolicy, globalCheckpointSupplier, primaryTermSupplier, persistedSequenceNumberConsumer);
 
-        // SECURITY: Strict validation - never allow null components
-        if (keyIvResolver == null || translogUUID == null) {
-            throw new IllegalStateException(
-                "CRITICAL SECURITY ERROR: Cannot create CryptoTranslog without keyIvResolver and translogUUID. "
-                    + "Required for translog encryption. keyIvResolver="
-                    + keyIvResolver
-                    + ", translogUUID="
-                    + translogUUID
-            );
-        }
-
-        // Initialize crypto components immediately after super() completes
+        // Initialize instance fields after super() completes
         this.translogUUID = translogUUID;
         this.keyIvResolver = keyIvResolver;
 
@@ -144,10 +182,27 @@ public class CryptoTranslog extends LocalTranslog {
                             translogUUID
                         );
 
-                    if (keyIvResolver != null && translogUUID != null) {
+                    // Check if instance fields are available, otherwise use ThreadLocal (constructor race condition)
+                    KeyIvResolver resolverToUse = keyIvResolver;
+                    String uuidToUse = translogUUID;
+
+                    if (resolverToUse == null || uuidToUse == null) {
+                        // CONSTRUCTOR RACE CONDITION: Use ThreadLocal values set by static factory method
+                        resolverToUse = CONSTRUCTOR_KEY_IV_RESOLVER.get();
+                        uuidToUse = CONSTRUCTOR_TRANSLOG_UUID.get();
+
+                        logger
+                            .error(
+                                "CRYPTO DEBUG: Using ThreadLocal values - keyIvResolver={}, translogUUID={}",
+                                (resolverToUse != null ? "AVAILABLE" : "NULL"),
+                                uuidToUse
+                            );
+                    }
+
+                    if (resolverToUse != null && uuidToUse != null) {
                         try {
-                            cryptoChannelFactory = new CryptoChannelFactory(keyIvResolver, translogUUID);
-                            logger.error("CRYPTO DEBUG: CryptoChannelFactory initialized successfully");
+                            cryptoChannelFactory = new CryptoChannelFactory(resolverToUse, uuidToUse);
+                            logger.error("CRYPTO DEBUG: CryptoChannelFactory initialized successfully during constructor race condition");
                         } catch (Exception e) {
                             logger.error("CRYPTO DEBUG: FAILED to initialize CryptoChannelFactory: {}", e.getMessage(), e);
                             // SECURITY: Never fall back to plain text - fail fast!
@@ -161,9 +216,11 @@ public class CryptoTranslog extends LocalTranslog {
                         // SECURITY: Never fall back to plain text - fail fast!
                         logger
                             .error(
-                                "CRYPTO DEBUG: MISSING REQUIRED COMPONENTS - keyIvResolver={}, translogUUID={}",
+                                "CRYPTO DEBUG: MISSING REQUIRED COMPONENTS - keyIvResolver={}, translogUUID={}, ThreadLocal keyIvResolver={}, ThreadLocal translogUUID={}",
                                 keyIvResolver,
-                                translogUUID
+                                translogUUID,
+                                CONSTRUCTOR_KEY_IV_RESOLVER.get(),
+                                CONSTRUCTOR_TRANSLOG_UUID.get()
                             );
                         throw new IllegalStateException(
                             "CRITICAL SECURITY ERROR: Cannot initialize crypto channel factory - missing keyIvResolver or translogUUID. "
@@ -171,6 +228,10 @@ public class CryptoTranslog extends LocalTranslog {
                                 + keyIvResolver
                                 + ", translogUUID="
                                 + translogUUID
+                                + ", ThreadLocal keyIvResolver="
+                                + CONSTRUCTOR_KEY_IV_RESOLVER.get()
+                                + ", ThreadLocal translogUUID="
+                                + CONSTRUCTOR_TRANSLOG_UUID.get()
                         );
                     }
                 }
@@ -187,34 +248,6 @@ public class CryptoTranslog extends LocalTranslog {
 
         logger.error("CRYPTO DEBUG: Returning CryptoChannelFactory - encryption enabled");
         return cryptoChannelFactory;
-    }
-
-    /**
-     * Override key translog operation methods to track actual usage
-     */
-    @Override
-    public Location add(Operation operation) throws IOException {
-        logger.error("CRYPTO DEBUG: CryptoTranslog.add() called - operation={}, instanceHash={}", operation.opType(), this.hashCode());
-        return super.add(operation);
-    }
-
-    @Override
-    public void rollGeneration() throws IOException {
-        logger.error("CRYPTO DEBUG: CryptoTranslog.rollGeneration() called - instanceHash={}", this.hashCode());
-        super.rollGeneration();
-    }
-
-    @Override
-    public boolean syncNeeded() {
-        boolean needed = super.syncNeeded();
-        logger.error("CRYPTO DEBUG: CryptoTranslog.syncNeeded() called - needed={}, instanceHash={}", needed, this.hashCode());
-        return needed;
-    }
-
-    @Override
-    public void sync() throws IOException {
-        logger.error("CRYPTO DEBUG: CryptoTranslog.sync() called - instanceHash={}", this.hashCode());
-        super.sync();
     }
 
     /**
