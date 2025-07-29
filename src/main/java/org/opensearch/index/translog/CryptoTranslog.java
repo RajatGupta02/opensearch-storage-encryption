@@ -146,6 +146,16 @@ public class CryptoTranslog extends LocalTranslog {
                 (cryptoChannelFactory != null ? "INITIALIZED" : "NULL"),
                 this.hashCode()
             );
+
+        // CRITICAL DEBUG: Test if getChannelFactory() works now
+        try {
+            logger.error("CRYPTO DEBUG: Testing getChannelFactory() call from constructor...");
+            ChannelFactory testFactory = getChannelFactory();
+            logger.error("CRYPTO DEBUG: getChannelFactory() test SUCCESS - got factory: {}", testFactory.getClass().getSimpleName());
+        } catch (Exception e) {
+            logger.error("CRYPTO DEBUG: getChannelFactory() test FAILED: {}", e.getMessage(), e);
+        }
+
         logger.info("CryptoTranslog initialized with AES-CTR encryption for translog: {}", translogUUID);
 
         // CRITICAL: Clean up ThreadLocal to prevent memory leaks after constructor completes
