@@ -188,12 +188,17 @@ public class CryptoFileChannelWrapper extends FileChannel {
                         byte[] key = keyIvResolver.getDataKey().getEncoded();
                         byte[] iv = keyIvResolver.getIvBytes();
                         long encryptedPosition = position + headerPortion;
+
+                        logger
+                            .error("CRYPTO DEBUG: read() decrypt boundary - pos={}, keyHex=[{}]", encryptedPosition, bytesToHex(key, 0, 8));
+
                         byte[] decryptedData = OpenSslNativeCipher.decrypt(key, iv, encryptedData, encryptedPosition);
 
                         // Put the decrypted data back into the buffer
                         dst.position(originalPosition - encryptedPortion);
                         dst.put(decryptedData);
                     } catch (Throwable e) {
+                        logger.error("CRYPTO DEBUG: read() decrypt FAILED at pos={}", position + headerPortion, e);
                         throw new IOException("Failed to decrypt data at position " + (position + headerPortion), e);
                     }
                 }
@@ -213,6 +218,15 @@ public class CryptoFileChannelWrapper extends FileChannel {
                     // Decrypt the data using unified key resolver
                     byte[] key = keyIvResolver.getDataKey().getEncoded();
                     byte[] iv = keyIvResolver.getIvBytes();
+
+                    logger
+                        .error(
+                            "CRYPTO DEBUG: read() decrypt full - pos={}, size={}, keyHex=[{}]",
+                            position,
+                            bytesRead,
+                            bytesToHex(key, 0, 8)
+                        );
+
                     byte[] decryptedData = OpenSslNativeCipher.decrypt(key, iv, encryptedData, position);
 
                     // Put the decrypted data back into the buffer
@@ -221,6 +235,7 @@ public class CryptoFileChannelWrapper extends FileChannel {
 
                     return bytesRead;
                 } catch (Throwable e) {
+                    logger.error("CRYPTO DEBUG: read() decrypt FAILED at pos={}", position, e);
                     throw new IOException("Failed to decrypt data at position " + position, e);
                 }
             }
@@ -279,27 +294,13 @@ public class CryptoFileChannelWrapper extends FileChannel {
             // Determine header size
             int headerSize = determineHeaderSize();
 
-            // CRITICAL DEBUG: Log every write operation
-            logger
-                .error(
-                    "CRYPTO DEBUG: write() called - position={}, dataSize={}, headerSize={}, filePath={}",
-                    position,
-                    src.remaining(),
-                    headerSize,
-                    filePath
-                );
-
             // If this write is entirely within the header, no encryption needed
             if (position + src.remaining() <= headerSize) {
-                logger.error("CRYPTO DEBUG: Writing to header area - position={}, size={}, no encryption", position, src.remaining());
                 return delegate.write(src, position);
             }
 
             // If this write starts within the header but extends beyond it
             if (position < headerSize && position + src.remaining() > headerSize) {
-                logger
-                    .error("CRYPTO DEBUG: Write spans header boundary - position={}, headerSize={}, splitting write", position, headerSize);
-
                 // Split the write into header and data portions
                 int headerPortion = (int) (headerSize - position);
                 int dataPortion = src.remaining() - headerPortion;
@@ -315,41 +316,20 @@ public class CryptoFileChannelWrapper extends FileChannel {
                     byte[] plainData = new byte[dataPortion];
                     src.get(plainData);
 
-                    logger.error("CRYPTO DEBUG: Encrypting data portion - size={}, position={}", dataPortion, position + headerPortion);
-
-                    // LOG PLAINTEXT DATA BEFORE ENCRYPTION
-                    logger
-                        .error(
-                            "CRYPTO DEBUG: PLAINTEXT DATA (boundary span) - position={}, size={}, preview=[{}], hex=[{}]",
-                            position + headerPortion,
-                            plainData.length,
-                            bytesToSafeString(plainData, 100),
-                            bytesToHex(plainData, 0, Math.min(50, plainData.length))
-                        );
-
                     // Encrypt the data using unified key resolver
                     try {
                         byte[] key = keyIvResolver.getDataKey().getEncoded();
                         byte[] iv = keyIvResolver.getIvBytes();
                         long encryptedPosition = position + headerPortion;
-                        byte[] encryptedData = OpenSslNativeCipher.encrypt(key, iv, plainData, encryptedPosition);
 
-                        // LOG ENCRYPTED DATA AFTER ENCRYPTION
                         logger
                             .error(
-                                "CRYPTO DEBUG: ENCRYPTED DATA (boundary span) - position={}, plainSize={}, encryptedSize={}, encryptedHex=[{}]",
+                                "CRYPTO DEBUG: write() encrypt boundary - pos={}, keyHex=[{}]",
                                 encryptedPosition,
-                                plainData.length,
-                                encryptedData.length,
-                                bytesToHex(encryptedData, 0, Math.min(50, encryptedData.length))
+                                bytesToHex(key, 0, 8)
                             );
 
-                        logger
-                            .error(
-                                "CRYPTO DEBUG: Encryption successful - plainSize={}, encryptedSize={}",
-                                plainData.length,
-                                encryptedData.length
-                            );
+                        byte[] encryptedData = OpenSslNativeCipher.encrypt(key, iv, plainData, encryptedPosition);
 
                         // Write the encrypted data
                         ByteBuffer encryptedBuffer = ByteBuffer.wrap(encryptedData);
@@ -357,7 +337,7 @@ public class CryptoFileChannelWrapper extends FileChannel {
 
                         return headerBytesWritten + dataBytesWritten;
                     } catch (Throwable e) {
-                        logger.error("CRYPTO DEBUG: Encryption FAILED - error={}", e.getMessage(), e);
+                        logger.error("CRYPTO DEBUG: write() encrypt FAILED at pos={}", position + headerPortion, e);
                         throw new IOException("Failed to encrypt data at position " + (position + headerPortion), e);
                     }
                 }
@@ -367,67 +347,29 @@ public class CryptoFileChannelWrapper extends FileChannel {
 
             // If this write is entirely beyond the header, encrypt all of it
             if (position >= headerSize) {
-                logger.error("CRYPTO DEBUG: Writing beyond header - position={}, size={}, encrypting all data", position, src.remaining());
-
                 try {
                     // Get the data to encrypt
                     byte[] plainData = new byte[src.remaining()];
                     src.get(plainData);
 
-                    logger.error("CRYPTO DEBUG: About to encrypt data - size={}, position={}", plainData.length, position);
-
-                    // LOG PLAINTEXT DATA BEFORE ENCRYPTION
-                    logger
-                        .error(
-                            "CRYPTO DEBUG: PLAINTEXT DATA (beyond header) - position={}, size={}, preview=[{}], hex=[{}]",
-                            position,
-                            plainData.length,
-                            bytesToSafeString(plainData, 100),
-                            bytesToHex(plainData, 0, Math.min(50, plainData.length))
-                        );
-
                     // Encrypt the data using unified key resolver
                     byte[] key = keyIvResolver.getDataKey().getEncoded();
                     byte[] iv = keyIvResolver.getIvBytes();
+
+                    logger.error("CRYPTO DEBUG: write() encrypt full - pos={}, keyHex=[{}]", position, bytesToHex(key, 0, 8));
+
                     byte[] encryptedData = OpenSslNativeCipher.encrypt(key, iv, plainData, position);
-
-                    // LOG ENCRYPTED DATA AFTER ENCRYPTION
-                    logger
-                        .error(
-                            "CRYPTO DEBUG: ENCRYPTED DATA (beyond header) - position={}, plainSize={}, encryptedSize={}, encryptedHex=[{}]",
-                            position,
-                            plainData.length,
-                            encryptedData.length,
-                            bytesToHex(encryptedData, 0, Math.min(50, encryptedData.length))
-                        );
-
-                    logger
-                        .error(
-                            "CRYPTO DEBUG: Encryption successful - plainSize={}, encryptedSize={}",
-                            plainData.length,
-                            encryptedData.length
-                        );
 
                     // Write the encrypted data
                     ByteBuffer encryptedBuffer = ByteBuffer.wrap(encryptedData);
                     int bytesWritten = delegate.write(encryptedBuffer, position);
 
-                    logger.error("CRYPTO DEBUG: Encrypted data written - bytesWritten={}", bytesWritten);
                     return bytesWritten;
                 } catch (Throwable e) {
-                    logger.error("CRYPTO DEBUG: Encryption FAILED - error={}", e.getMessage(), e);
+                    logger.error("CRYPTO DEBUG: write() encrypt FAILED at pos={}", position, e);
                     throw new IOException("Failed to encrypt data at position " + position, e);
                 }
             }
-
-            // Fallback to direct write (THIS SHOULD NEVER HAPPEN!)
-            logger
-                .error(
-                    "CRYPTO DEBUG: FALLBACK WRITE - THIS IS A BUG! position={}, headerSize={}, size={}",
-                    position,
-                    headerSize,
-                    src.remaining()
-                );
             return delegate.write(src, position);
         } finally {
             positionLock.writeLock().unlock();
