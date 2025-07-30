@@ -21,6 +21,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.codecs.CodecUtil;
 import org.opensearch.index.store.cipher.OpenSslNativeCipher;
 import org.opensearch.index.store.iv.KeyIvResolver;
 
@@ -54,6 +55,11 @@ public class CryptoFileChannelWrapper extends FileChannel {
     // Constants for better consistency
     private static final int BUFFER_SIZE = 16_384;
 
+    // TranslogHeader constants replicated to avoid cross-classloader access
+    private static final String TRANSLOG_CODEC = "translog";
+    private static final int VERSION_PRIMARY_TERM = 3;
+    private static final int CURRENT_VERSION = VERSION_PRIMARY_TERM;
+
     /**
      * Creates a new CryptoFileChannelWrapper that wraps the provided FileChannel.
      *
@@ -84,8 +90,8 @@ public class CryptoFileChannelWrapper extends FileChannel {
     }
 
     /**
-     * Determines the exact header size using OpenSearch's TranslogHeader.headerSizeInBytes() method.
-     * This eliminates ALL file reading and estimation - uses pure calculation based on UUID.
+     * Determines the exact header size using local calculation to avoid cross-classloader access.
+     * This replicates the exact same logic as TranslogHeader.headerSizeInBytes() method.
      */
     private int determineHeaderSize() {
         if (actualHeaderSize > 0) {
@@ -94,7 +100,8 @@ public class CryptoFileChannelWrapper extends FileChannel {
 
         String fileName = filePath.getFileName().toString();
         if (fileName.endsWith(".tlog")) {
-            actualHeaderSize = TranslogHeader.headerSizeInBytes(translogUUID);
+            // Replicate TranslogHeader.headerSizeInBytes() logic to avoid IllegalAccessError
+            actualHeaderSize = calculateTranslogHeaderSize(translogUUID);
             logger.debug("Calculated exact header size: {} bytes for {} with UUID: {}", actualHeaderSize, filePath, translogUUID);
         } else {
             // Non-translog files (.ckp) don't need encryption anyway
@@ -103,6 +110,30 @@ public class CryptoFileChannelWrapper extends FileChannel {
         }
 
         return actualHeaderSize;
+    }
+
+    /**
+     * Local implementation of TranslogHeader.headerSizeInBytes() to avoid cross-classloader access issues.
+     * This replicates the exact same calculation as the original method.
+     *
+     * @param translogUUID the translog UUID
+     * @return the header size in bytes
+     */
+    private static int calculateTranslogHeaderSize(String translogUUID) {
+        // Replicate: headerSizeInBytes(CURRENT_VERSION, new BytesRef(translogUUID).length)
+        int uuidLength = translogUUID.getBytes().length;
+
+        // Replicate the internal calculation
+        int size = CodecUtil.headerLength(TRANSLOG_CODEC); // Lucene codec header
+        size += Integer.BYTES + uuidLength; // uuid length field + uuid bytes
+
+        // VERSION_PRIMARY_TERM = 3, CURRENT_VERSION = 3
+        if (CURRENT_VERSION >= VERSION_PRIMARY_TERM) {
+            size += Long.BYTES;    // primary term
+            size += Integer.BYTES; // checksum
+        }
+
+        return size;
     }
 
     @Override
