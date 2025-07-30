@@ -53,8 +53,7 @@ public class CryptoTranslogFactory implements TranslogFactory {
             );
 
         // Create a crypto-enabled translog with unified key resolver using static factory method
-        CryptoTranslog cryptoTranslog = CryptoTranslog
-            .create(
+        CryptoTranslog cryptoTranslog = new CryptoTranslog(
                 config,
                 translogUUID,
                 deletionPolicy,
