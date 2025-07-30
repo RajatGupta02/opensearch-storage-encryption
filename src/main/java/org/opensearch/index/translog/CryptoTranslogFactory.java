@@ -54,14 +54,14 @@ public class CryptoTranslogFactory implements TranslogFactory {
 
         // Create a crypto-enabled translog with unified key resolver using static factory method
         CryptoTranslog cryptoTranslog = new CryptoTranslog(
-                config,
-                translogUUID,
-                deletionPolicy,
-                globalCheckpointSupplier,
-                primaryTermSupplier,
-                persistedSequenceNumberConsumer,
-                keyIvResolver
-            );
+            config,
+            translogUUID,
+            deletionPolicy,
+            globalCheckpointSupplier,
+            primaryTermSupplier,
+            persistedSequenceNumberConsumer,
+            keyIvResolver
+        );
 
         logger.error("CRYPTO DEBUG: CryptoTranslogFactory created CryptoTranslog instance - hashCode={}", cryptoTranslog.hashCode());
         return cryptoTranslog;
