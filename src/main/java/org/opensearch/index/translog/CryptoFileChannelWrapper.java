@@ -385,6 +385,36 @@ public class CryptoFileChannelWrapper extends FileChannel {
                                 dataToHex(encryptedData, 16)
                             );
 
+                        // ROUND-TRIP TEST: Immediately test decryption to verify integrity
+                        try {
+                            byte[] testDecrypted = OpenSslNativeCipher.decrypt(key, iv, encryptedData, encryptedPosition);
+                            boolean roundTripOK = java.util.Arrays.equals(exactPlainData, testDecrypted);
+                            logger
+                                .error(
+                                    "ROUND-TRIP TEST: write boundary - pos={}, size={}, success=[{}]",
+                                    encryptedPosition,
+                                    dataPortion,
+                                    roundTripOK
+                                );
+                            if (!roundTripOK) {
+                                logger
+                                    .error(
+                                        "ROUND-TRIP FAILURE: Original=[{}], Decrypted=[{}]",
+                                        dataToHex(exactPlainData, 16),
+                                        dataToHex(testDecrypted, 16)
+                                    );
+                            }
+                            clearSensitiveData(testDecrypted, testDecrypted.length);
+                        } catch (Exception rtException) {
+                            logger
+                                .error(
+                                    "ROUND-TRIP ERROR: write boundary - pos={}, size={}, error={}",
+                                    encryptedPosition,
+                                    dataPortion,
+                                    rtException.getMessage()
+                                );
+                        }
+
                         // Write the encrypted data
                         ByteBuffer encryptedBuffer = ByteBuffer.wrap(encryptedData);
                         int dataBytesWritten = delegate.write(encryptedBuffer, encryptedPosition);
@@ -433,6 +463,30 @@ public class CryptoFileChannelWrapper extends FileChannel {
                             dataSize,
                             dataToHex(encryptedData, 16)
                         );
+
+                    // ROUND-TRIP TEST: Immediately test decryption to verify integrity
+                    try {
+                        byte[] testDecrypted = OpenSslNativeCipher.decrypt(key, iv, encryptedData, position);
+                        boolean roundTripOK = java.util.Arrays.equals(exactPlainData, testDecrypted);
+                        logger.error("ROUND-TRIP TEST: write full - pos={}, size={}, success=[{}]", position, dataSize, roundTripOK);
+                        if (!roundTripOK) {
+                            logger
+                                .error(
+                                    "ROUND-TRIP FAILURE: Original=[{}], Decrypted=[{}]",
+                                    dataToHex(exactPlainData, 16),
+                                    dataToHex(testDecrypted, 16)
+                                );
+                        }
+                        clearSensitiveData(testDecrypted, testDecrypted.length);
+                    } catch (Exception rtException) {
+                        logger
+                            .error(
+                                "ROUND-TRIP ERROR: write full - pos={}, size={}, error={}",
+                                position,
+                                dataSize,
+                                rtException.getMessage()
+                            );
+                    }
 
                     // Write the encrypted data
                     ByteBuffer encryptedBuffer = ByteBuffer.wrap(encryptedData);
