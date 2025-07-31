@@ -23,7 +23,6 @@ import org.opensearch.index.store.iv.KeyIvResolver;
  * This factory determines whether to apply encryption based on the file extension:
  * - .tlog files: Encrypted using AES-CTR
  * - .ckp files: Not encrypted (checkpoint metadata)
- * - Other files: Not encrypted
  *
  * Updated to use unified KeyIvResolver (same as index files) for consistent
  * key management across all encrypted components.

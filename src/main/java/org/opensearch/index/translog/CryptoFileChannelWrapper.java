@@ -724,25 +724,6 @@ public class CryptoFileChannelWrapper extends FileChannel {
     }
 
     /**
-     * Helper method to convert bytes to hex string for debug logging.
-     */
-    private static String bytesToHex(byte[] bytes, int offset, int length) {
-        if (bytes == null || bytes.length == 0) {
-            return "";
-        }
-        StringBuilder hexString = new StringBuilder();
-        int end = Math.min(offset + length, bytes.length);
-        for (int i = offset; i < end; i++) {
-            String hex = Integer.toHexString(0xFF & bytes[i]);
-            if (hex.length() == 1) {
-                hexString.append('0');
-            }
-            hexString.append(hex);
-        }
-        return hexString.toString();
-    }
-
-    /**
      * Helper method to convert data to hex string for end-to-end testing.
      * Shows first 16 bytes of actual data being encrypted/decrypted.
      */

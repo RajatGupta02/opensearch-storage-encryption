@@ -67,7 +67,7 @@ public class CryptoTranslog extends LocalTranslog {
             createCryptoChannelFactory(keyIvResolver, translogUUID)
         );
 
-        // SECURITY: Strict validation after super() - never allow null components
+        // Strict validation after super() - never allow null components
         if (keyIvResolver == null || translogUUID == null) {
             throw new IllegalArgumentException(
                 "CRITICAL SECURITY ERROR: Cannot create CryptoTranslog without keyIvResolver and translogUUID. "
@@ -94,14 +94,11 @@ public class CryptoTranslog extends LocalTranslog {
         try {
             CryptoChannelFactory channelFactory = new CryptoChannelFactory(keyIvResolver, translogUUID);
             LogManager.getLogger(CryptoTranslog.class).debug("CryptoChannelFactory initialized for translog: {}", translogUUID);
-            return channelFactory; // CryptoChannelFactory implements ChannelFactory
+            return channelFactory;
         } catch (Exception e) {
-            LogManager
-                .getLogger(CryptoTranslog.class)
-                .error("CRITICAL SECURITY ERROR: Failed to initialize CryptoChannelFactory: {}", e.getMessage(), e);
+            LogManager.getLogger(CryptoTranslog.class).error("Failed to initialize CryptoChannelFactory: {}", e.getMessage(), e);
             throw new IOException(
-                "CRITICAL SECURITY ERROR: Failed to initialize crypto channel factory for translog encryption. "
-                    + "Cannot proceed without encryption!",
+                "Failed to initialize crypto channel factory for translog encryption. " + "Cannot proceed without encryption!",
                 e
             );
         }
