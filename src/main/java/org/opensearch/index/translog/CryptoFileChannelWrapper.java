@@ -188,12 +188,27 @@ public class CryptoFileChannelWrapper extends FileChannel {
                         byte[] iv = keyIvResolver.getIvBytes();
                         long encryptedPosition = position + headerPortion;
 
+                        // END-TO-END TEST: Log encrypted data read from disk
                         logger
-                            .error("CRYPTO DEBUG: read() decrypt boundary - pos={}, keyHex=[{}]", encryptedPosition, bytesToHex(key, 0, 8));
+                            .error(
+                                "DECRYPT TEST: read boundary - pos={}, size={}, encrypted=[{}]",
+                                encryptedPosition,
+                                encryptedPortion,
+                                dataToHex(encryptedData, 16)
+                            );
 
                         // Create exact-sized array for decryption (OpenSslNativeCipher requires exact size)
                         byte[] exactEncryptedData = java.util.Arrays.copyOf(encryptedData, encryptedPortion);
                         byte[] decryptedData = OpenSslNativeCipher.decrypt(key, iv, exactEncryptedData, encryptedPosition);
+
+                        // END-TO-END TEST: Log decrypted data after decryption
+                        logger
+                            .error(
+                                "DECRYPT TEST: read boundary - pos={}, size={}, decrypted=[{}]",
+                                encryptedPosition,
+                                encryptedPortion,
+                                dataToHex(decryptedData, 16)
+                            );
 
                         // Put the decrypted data back into the buffer
                         dst.position(originalPosition - encryptedPortion);
@@ -227,17 +242,27 @@ public class CryptoFileChannelWrapper extends FileChannel {
                     byte[] key = keyIvResolver.getDataKey().getEncoded();
                     byte[] iv = keyIvResolver.getIvBytes();
 
+                    // END-TO-END TEST: Log encrypted data read from disk
                     logger
                         .error(
-                            "CRYPTO DEBUG: read() decrypt full - pos={}, size={}, keyHex=[{}]",
+                            "DECRYPT TEST: read full - pos={}, size={}, encrypted=[{}]",
                             position,
                             bytesRead,
-                            bytesToHex(key, 0, 8)
+                            dataToHex(encryptedData, 16)
                         );
 
                     // Create exact-sized array for decryption
                     byte[] exactEncryptedData = java.util.Arrays.copyOf(encryptedData, bytesRead);
                     byte[] decryptedData = OpenSslNativeCipher.decrypt(key, iv, exactEncryptedData, position);
+
+                    // END-TO-END TEST: Log decrypted data after decryption
+                    logger
+                        .error(
+                            "DECRYPT TEST: read full - pos={}, size={}, decrypted=[{}]",
+                            position,
+                            bytesRead,
+                            dataToHex(decryptedData, 16)
+                        );
 
                     // Put the decrypted data back into the buffer
                     dst.position(originalPosition - bytesRead);
@@ -338,16 +363,27 @@ public class CryptoFileChannelWrapper extends FileChannel {
                         byte[] iv = keyIvResolver.getIvBytes();
                         long encryptedPosition = position + headerPortion;
 
+                        // END-TO-END TEST: Log plaintext data before encryption
                         logger
                             .error(
-                                "CRYPTO DEBUG: write() encrypt boundary - pos={}, keyHex=[{}]",
+                                "ENCRYPT TEST: write boundary - pos={}, size={}, plaintext=[{}]",
                                 encryptedPosition,
-                                bytesToHex(key, 0, 8)
+                                dataPortion,
+                                dataToHex(plainData, 16)
                             );
 
                         // Create exact-sized array for encryption
                         byte[] exactPlainData = java.util.Arrays.copyOf(plainData, dataPortion);
                         byte[] encryptedData = OpenSslNativeCipher.encrypt(key, iv, exactPlainData, encryptedPosition);
+
+                        // END-TO-END TEST: Log encrypted data after encryption
+                        logger
+                            .error(
+                                "ENCRYPT TEST: write boundary - pos={}, size={}, encrypted=[{}]",
+                                encryptedPosition,
+                                dataPortion,
+                                dataToHex(encryptedData, 16)
+                            );
 
                         // Write the encrypted data
                         ByteBuffer encryptedBuffer = ByteBuffer.wrap(encryptedData);
@@ -381,11 +417,22 @@ public class CryptoFileChannelWrapper extends FileChannel {
                     byte[] key = keyIvResolver.getDataKey().getEncoded();
                     byte[] iv = keyIvResolver.getIvBytes();
 
-                    logger.error("CRYPTO DEBUG: write() encrypt full - pos={}, keyHex=[{}]", position, bytesToHex(key, 0, 8));
+                    // END-TO-END TEST: Log plaintext data before encryption
+                    logger
+                        .error("ENCRYPT TEST: write full - pos={}, size={}, plaintext=[{}]", position, dataSize, dataToHex(plainData, 16));
 
                     // Create exact-sized array for encryption
                     byte[] exactPlainData = java.util.Arrays.copyOf(plainData, dataSize);
                     byte[] encryptedData = OpenSslNativeCipher.encrypt(key, iv, exactPlainData, position);
+
+                    // END-TO-END TEST: Log encrypted data after encryption
+                    logger
+                        .error(
+                            "ENCRYPT TEST: write full - pos={}, size={}, encrypted=[{}]",
+                            position,
+                            dataSize,
+                            dataToHex(encryptedData, 16)
+                        );
 
                     // Write the encrypted data
                     ByteBuffer encryptedBuffer = ByteBuffer.wrap(encryptedData);
@@ -639,5 +686,28 @@ public class CryptoFileChannelWrapper extends FileChannel {
             hexString.append(hex);
         }
         return hexString.toString();
+    }
+
+    /**
+     * Helper method to convert data to hex string for end-to-end testing.
+     * Shows first 16 bytes of actual data being encrypted/decrypted.
+     */
+    private static String dataToHex(byte[] data, int maxBytes) {
+        if (data == null || data.length == 0) {
+            return "[empty]";
+        }
+        int bytesToShow = Math.min(maxBytes, data.length);
+        StringBuilder hex = new StringBuilder();
+        for (int i = 0; i < bytesToShow; i++) {
+            String hexByte = Integer.toHexString(0xFF & data[i]);
+            if (hexByte.length() == 1) {
+                hex.append('0');
+            }
+            hex.append(hexByte);
+        }
+        if (data.length > maxBytes) {
+            hex.append("...[+").append(data.length - maxBytes).append(" more]");
+        }
+        return hex.toString();
     }
 }
