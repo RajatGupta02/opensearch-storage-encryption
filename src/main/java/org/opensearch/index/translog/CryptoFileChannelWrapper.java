@@ -46,14 +46,14 @@ public class CryptoFileChannelWrapper extends FileChannel {
     private final ReentrantReadWriteLock positionLock;
     private volatile boolean closed = false;
 
-    // Thread-local buffer for efficient encryption/decryption
-    private static final ThreadLocal<ByteBuffer> TEMP_BUFFER = ThreadLocal.withInitial(() -> ByteBuffer.allocate(16_384));
+    // Constants for better consistency
+    private static final int BUFFER_SIZE = 16_384;
+
+    // Thread-local buffer for efficient encryption/decryption operations
+    private static final ThreadLocal<byte[]> TEMP_BYTE_ARRAY = ThreadLocal.withInitial(() -> new byte[BUFFER_SIZE]);
 
     // Header size - calculated exactly using TranslogHeader.headerSizeInBytes()
     private volatile int actualHeaderSize = -1;
-
-    // Constants for better consistency
-    private static final int BUFFER_SIZE = 16_384;
 
     // TranslogHeader constants replicated to avoid cross-classloader access
     private static final String TRANSLOG_CODEC = "translog";
@@ -100,7 +100,6 @@ public class CryptoFileChannelWrapper extends FileChannel {
 
         String fileName = filePath.getFileName().toString();
         if (fileName.endsWith(".tlog")) {
-            // Replicate TranslogHeader.headerSizeInBytes() logic to avoid IllegalAccessError
             actualHeaderSize = calculateTranslogHeaderSize(translogUUID);
             logger.debug("Calculated exact header size: {} bytes for {} with UUID: {}", actualHeaderSize, filePath, translogUUID);
         } else {
@@ -177,11 +176,11 @@ public class CryptoFileChannelWrapper extends FileChannel {
                 int encryptedPortion = bytesRead - headerPortion;
 
                 if (encryptedPortion > 0) {
-                    // Get the encrypted data portion
-                    byte[] encryptedData = new byte[encryptedPortion];
+                    // Get the encrypted data portion using ThreadLocal buffer
+                    byte[] encryptedData = getTempByteArray(encryptedPortion);
                     int originalPosition = dst.position();
                     dst.position(originalPosition - encryptedPortion);
-                    dst.get(encryptedData);
+                    dst.get(encryptedData, 0, encryptedPortion);
 
                     // Decrypt the data using unified key resolver
                     try {
@@ -192,13 +191,22 @@ public class CryptoFileChannelWrapper extends FileChannel {
                         logger
                             .error("CRYPTO DEBUG: read() decrypt boundary - pos={}, keyHex=[{}]", encryptedPosition, bytesToHex(key, 0, 8));
 
-                        byte[] decryptedData = OpenSslNativeCipher.decrypt(key, iv, encryptedData, encryptedPosition);
+                        // Create exact-sized array for decryption (OpenSslNativeCipher requires exact size)
+                        byte[] exactEncryptedData = java.util.Arrays.copyOf(encryptedData, encryptedPortion);
+                        byte[] decryptedData = OpenSslNativeCipher.decrypt(key, iv, exactEncryptedData, encryptedPosition);
 
                         // Put the decrypted data back into the buffer
                         dst.position(originalPosition - encryptedPortion);
                         dst.put(decryptedData);
+
+                        // Clear sensitive data
+                        clearSensitiveData(encryptedData, encryptedPortion);
+                        clearSensitiveData(exactEncryptedData, exactEncryptedData.length);
+                        clearSensitiveData(decryptedData, decryptedData.length);
                     } catch (Throwable e) {
                         logger.error("CRYPTO DEBUG: read() decrypt FAILED at pos={}", position + headerPortion, e);
+                        // Clear sensitive data even on error
+                        clearSensitiveData(encryptedData, encryptedPortion);
                         throw new IOException("Failed to decrypt data at position " + (position + headerPortion), e);
                     }
                 }
@@ -209,11 +217,11 @@ public class CryptoFileChannelWrapper extends FileChannel {
             // If this read is entirely beyond the header, decrypt all of it
             if (position >= headerSize) {
                 try {
-                    // Get the data that was just read
-                    byte[] encryptedData = new byte[bytesRead];
+                    // Get the data that was just read using ThreadLocal buffer
+                    byte[] encryptedData = getTempByteArray(bytesRead);
                     int originalPosition = dst.position();
                     dst.position(originalPosition - bytesRead);
-                    dst.get(encryptedData);
+                    dst.get(encryptedData, 0, bytesRead);
 
                     // Decrypt the data using unified key resolver
                     byte[] key = keyIvResolver.getDataKey().getEncoded();
@@ -227,11 +235,18 @@ public class CryptoFileChannelWrapper extends FileChannel {
                             bytesToHex(key, 0, 8)
                         );
 
-                    byte[] decryptedData = OpenSslNativeCipher.decrypt(key, iv, encryptedData, position);
+                    // Create exact-sized array for decryption
+                    byte[] exactEncryptedData = java.util.Arrays.copyOf(encryptedData, bytesRead);
+                    byte[] decryptedData = OpenSslNativeCipher.decrypt(key, iv, exactEncryptedData, position);
 
                     // Put the decrypted data back into the buffer
                     dst.position(originalPosition - bytesRead);
                     dst.put(decryptedData);
+
+                    // Clear sensitive data
+                    clearSensitiveData(encryptedData, bytesRead);
+                    clearSensitiveData(exactEncryptedData, exactEncryptedData.length);
+                    clearSensitiveData(decryptedData, decryptedData.length);
 
                     return bytesRead;
                 } catch (Throwable e) {
@@ -313,8 +328,9 @@ public class CryptoFileChannelWrapper extends FileChannel {
 
                 // Write data portion with encryption
                 if (dataPortion > 0 && headerBytesWritten == headerPortion) {
-                    byte[] plainData = new byte[dataPortion];
-                    src.get(plainData);
+                    // Use ThreadLocal buffer for plain data
+                    byte[] plainData = getTempByteArray(dataPortion);
+                    src.get(plainData, 0, dataPortion);
 
                     // Encrypt the data using unified key resolver
                     try {
@@ -329,15 +345,23 @@ public class CryptoFileChannelWrapper extends FileChannel {
                                 bytesToHex(key, 0, 8)
                             );
 
-                        byte[] encryptedData = OpenSslNativeCipher.encrypt(key, iv, plainData, encryptedPosition);
+                        // Create exact-sized array for encryption
+                        byte[] exactPlainData = java.util.Arrays.copyOf(plainData, dataPortion);
+                        byte[] encryptedData = OpenSslNativeCipher.encrypt(key, iv, exactPlainData, encryptedPosition);
 
                         // Write the encrypted data
                         ByteBuffer encryptedBuffer = ByteBuffer.wrap(encryptedData);
                         int dataBytesWritten = delegate.write(encryptedBuffer, encryptedPosition);
 
+                        // Clear sensitive data
+                        clearSensitiveData(plainData, dataPortion);
+                        clearSensitiveData(exactPlainData, exactPlainData.length);
+
                         return headerBytesWritten + dataBytesWritten;
                     } catch (Throwable e) {
                         logger.error("CRYPTO DEBUG: write() encrypt FAILED at pos={}", position + headerPortion, e);
+                        // Clear sensitive data even on error
+                        clearSensitiveData(plainData, dataPortion);
                         throw new IOException("Failed to encrypt data at position " + (position + headerPortion), e);
                     }
                 }
@@ -348,9 +372,10 @@ public class CryptoFileChannelWrapper extends FileChannel {
             // If this write is entirely beyond the header, encrypt all of it
             if (position >= headerSize) {
                 try {
-                    // Get the data to encrypt
-                    byte[] plainData = new byte[src.remaining()];
-                    src.get(plainData);
+                    // Get the data to encrypt using ThreadLocal buffer
+                    int dataSize = src.remaining();
+                    byte[] plainData = getTempByteArray(dataSize);
+                    src.get(plainData, 0, dataSize);
 
                     // Encrypt the data using unified key resolver
                     byte[] key = keyIvResolver.getDataKey().getEncoded();
@@ -358,11 +383,17 @@ public class CryptoFileChannelWrapper extends FileChannel {
 
                     logger.error("CRYPTO DEBUG: write() encrypt full - pos={}, keyHex=[{}]", position, bytesToHex(key, 0, 8));
 
-                    byte[] encryptedData = OpenSslNativeCipher.encrypt(key, iv, plainData, position);
+                    // Create exact-sized array for encryption
+                    byte[] exactPlainData = java.util.Arrays.copyOf(plainData, dataSize);
+                    byte[] encryptedData = OpenSslNativeCipher.encrypt(key, iv, exactPlainData, position);
 
                     // Write the encrypted data
                     ByteBuffer encryptedBuffer = ByteBuffer.wrap(encryptedData);
                     int bytesWritten = delegate.write(encryptedBuffer, position);
+
+                    // Clear sensitive data
+                    clearSensitiveData(plainData, dataSize);
+                    clearSensitiveData(exactPlainData, exactPlainData.length);
 
                     return bytesWritten;
                 } catch (Throwable e) {
@@ -443,7 +474,6 @@ public class CryptoFileChannelWrapper extends FileChannel {
         ensureOpen();
 
         // For encrypted files, we need to decrypt data during transfer
-        // This is less efficient but ensures data is properly decrypted
         long transferred = 0;
         long remaining = count;
         ByteBuffer buffer = ByteBuffer.allocate(8192);
@@ -561,6 +591,38 @@ public class CryptoFileChannelWrapper extends FileChannel {
     }
 
     /**
+     * Gets a temporary byte array from ThreadLocal storage, expanding if needed.
+     * This reduces GC pressure by reusing arrays across operations.
+     *
+     * @param minSize the minimum required size
+     * @return a byte array of at least minSize capacity
+     */
+    private static byte[] getTempByteArray(int minSize) {
+        byte[] array = TEMP_BYTE_ARRAY.get();
+        if (array.length < minSize) {
+            // Expand the array, use next power of 2 or minSize, whichever is larger
+            int newSize = Math.max(minSize, Integer.highestOneBit(minSize - 1) << 1);
+            array = new byte[newSize];
+            TEMP_BYTE_ARRAY.set(array);
+        }
+        return array;
+    }
+
+    /**
+     * Clears sensitive data from the temporary array after use.
+     * This ensures encryption keys and plaintext don't linger in memory.
+     *
+     * @param array the array to clear
+     * @param length the number of bytes to clear from the start
+     */
+    private static void clearSensitiveData(byte[] array, int length) {
+        if (array != null && length > 0) {
+            int clearLength = Math.min(length, array.length);
+            java.util.Arrays.fill(array, 0, clearLength, (byte) 0);
+        }
+    }
+
+    /**
      * Helper method to convert bytes to hex string for debug logging.
      */
     private static String bytesToHex(byte[] bytes, int offset, int length) {
@@ -577,28 +639,5 @@ public class CryptoFileChannelWrapper extends FileChannel {
             hexString.append(hex);
         }
         return hexString.toString();
-    }
-
-    /**
-     * Helper method to safely convert bytes to string for debug logging.
-     */
-    private static String bytesToSafeString(byte[] bytes, int maxLength) {
-        if (bytes == null || bytes.length == 0) {
-            return "";
-        }
-        int length = Math.min(maxLength, bytes.length);
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < length; i++) {
-            byte b = bytes[i];
-            if (b >= 32 && b <= 126) { // Printable ASCII
-                sb.append((char) b);
-            } else {
-                sb.append("\\x").append(String.format("%02x", b & 0xFF));
-            }
-        }
-        if (bytes.length > maxLength) {
-            sb.append("...[truncated]");
-        }
-        return sb.toString();
     }
 }
