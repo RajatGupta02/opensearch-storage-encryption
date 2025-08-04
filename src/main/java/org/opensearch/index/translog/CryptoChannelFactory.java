@@ -12,8 +12,6 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 import org.opensearch.index.store.iv.KeyIvResolver;
 
 /**
@@ -30,8 +28,6 @@ import org.opensearch.index.store.iv.KeyIvResolver;
  * @opensearch.internal
  */
 public class CryptoChannelFactory implements ChannelFactory {
-
-    private static final Logger logger = LogManager.getLogger(CryptoChannelFactory.class);
 
     private final KeyIvResolver keyIvResolver;
     private final String translogUUID;

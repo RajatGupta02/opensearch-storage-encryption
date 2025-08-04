@@ -70,7 +70,7 @@ public class CryptoTranslog extends LocalTranslog {
         // Strict validation after super() - never allow null components
         if (keyIvResolver == null || translogUUID == null) {
             throw new IllegalArgumentException(
-                "CRITICAL SECURITY ERROR: Cannot create CryptoTranslog without keyIvResolver and translogUUID. "
+                "Cannot create CryptoTranslog without keyIvResolver and translogUUID. "
                     + "Required for translog encryption. keyIvResolver="
                     + keyIvResolver
                     + ", translogUUID="
@@ -82,7 +82,7 @@ public class CryptoTranslog extends LocalTranslog {
         this.keyIvResolver = keyIvResolver;
         this.translogUUID = translogUUID;
 
-        logger.info("CryptoTranslog initialized with AES-GCM encryption for translog: {}", translogUUID);
+        logger.info("CryptoTranslog initialized for translog: {}", translogUUID);
     }
 
     /**

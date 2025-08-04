@@ -558,14 +558,4 @@ public class CryptoFileChannelWrapper extends FileChannel {
     public FileChannel getDelegate() {
         return delegate;
     }
-
-    /**
-     * Gets the determined header size for this translog file.
-     * Uses exact calculation based on translogUUID - no exceptions possible.
-     *
-     * @return the header size in bytes
-     */
-    public int getHeaderSize() {
-        return determineHeaderSize();
-    }
 }

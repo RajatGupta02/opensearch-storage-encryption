@@ -32,7 +32,6 @@ public class CryptoEngineFactory implements EngineFactory {
      */
     @Override
     public Engine newReadWriteEngine(EngineConfig config) {
-        logger.error("CRYPTO DEBUG: CryptoEngineFactory.newReadWriteEngine() called for shard: {}", config.getShardId());
 
         try {
             // Create a separate KeyIvResolver for translog encryption
@@ -40,8 +39,6 @@ public class CryptoEngineFactory implements EngineFactory {
 
             // Create the crypto translog factory using the same KeyIvResolver as the directory
             CryptoTranslogFactory cryptoTranslogFactory = new CryptoTranslogFactory(keyIvResolver);
-
-            logger.error("CRYPTO DEBUG: Created CryptoTranslogFactory - hashCode={}", cryptoTranslogFactory.hashCode());
 
             // Create new engine config by copying all fields from existing config
             // but replace the translog factory with our crypto version
@@ -116,7 +113,7 @@ public class CryptoEngineFactory implements EngineFactory {
         // We pass null for MapperService and use a simple logger since we're just
         // preserving the existing codec behavior
         return new org.opensearch.index.codec.CodecService(
-            null, // MapperService - null is acceptable for basic codec functionality
+            null,
             config.getIndexSettings(),
             org.apache.logging.log4j.LogManager.getLogger(CryptoEngineFactory.class)
         );
