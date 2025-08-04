@@ -11,16 +11,12 @@ import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
-import java.nio.channels.FileChannel.MapMode;
 import java.nio.channels.FileLock;
 import java.nio.channels.ReadableByteChannel;
 import java.nio.channels.WritableByteChannel;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.security.Key;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.util.Arrays;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -241,134 +237,28 @@ public class CryptoFileChannelWrapper extends FileChannel {
     }
 
     /**
-     * Encrypts and writes a complete chunk to disk with comprehensive logging and round-trip verification.
+     * Encrypts and writes a complete chunk to disk.
      */
     private void encryptAndWriteChunk(int chunkIndex, byte[] plainData) throws IOException {
         try {
-            // 1. Log original data before encryption
-            String originalHash = bytesToSha256(plainData);
-            String originalHex = bytesToHex(plainData, 32);
-            logger
-                .info(
-                    "CRYPTO-WRITE chunk={} file={} size={} hash={} data={}",
-                    chunkIndex,
-                    filePath.getFileName(),
-                    plainData.length,
-                    originalHash,
-                    originalHex
-                );
-
-            // 2. Use existing key management
+            // Use existing key management
             Key key = keyIvResolver.getDataKey();
             byte[] baseIV = keyIvResolver.getIvBytes();
 
-            // 3. Use existing IV computation for this chunk
+            // Use existing IV computation for this chunk
             long chunkOffset = (long) chunkIndex * GCM_CHUNK_SIZE;
             byte[] chunkIV = computeOffsetIVForAesGcmEncrypted(baseIV, chunkOffset);
 
-            // 4. Use existing GCM encryption (includes authentication tag)
+            // Use existing GCM encryption (includes authentication tag)
             byte[] encryptedWithTag = AesGcmCipherFactory.encryptWithTag(key, chunkIV, plainData, plainData.length);
 
-            // 5. Log encrypted data
-            String encryptedHex = bytesToHex(encryptedWithTag, 32);
-            logger
-                .info(
-                    "CRYPTO-ENCRYPTED chunk={} file={} size={} data={} tag={}bytes",
-                    chunkIndex,
-                    filePath.getFileName(),
-                    encryptedWithTag.length,
-                    encryptedHex,
-                    GCM_TAG_SIZE
-                );
-
-            // 6. Write to disk at chunk position
+            // Write to disk at chunk position
             long diskPosition = determineHeaderSize() + ((long) chunkIndex * CHUNK_WITH_TAG_SIZE);
             ByteBuffer buffer = ByteBuffer.wrap(encryptedWithTag);
             delegate.write(buffer, diskPosition);
 
-            // 7. Immediate round-trip verification - read back and decrypt
-            try {
-                byte[] decrypted = readAndDecryptChunk(chunkIndex);
-                String decryptedHash = bytesToSha256(decrypted);
-                String decryptedHex = bytesToHex(decrypted, 32);
-
-                // 8. Compare and log results
-                boolean matches = Arrays.equals(plainData, decrypted);
-                logger
-                    .info(
-                        "CRYPTO-ROUNDTRIP chunk={} file={} size={} hash={} data={} RESULT={}",
-                        chunkIndex,
-                        filePath.getFileName(),
-                        decrypted.length,
-                        decryptedHash,
-                        decryptedHex,
-                        matches ? "✅VERIFIED" : "❌FAILED"
-                    );
-
-                if (!matches) {
-                    logger.error("CRITICAL: Round-trip verification failed for chunk {} in file {}", chunkIndex, filePath);
-                    logger.error("Original data length: {}, decrypted length: {}", plainData.length, decrypted.length);
-                    logger.error("Original hash: {}, decrypted hash: {}", originalHash, decryptedHash);
-                }
-            } catch (Exception roundTripError) {
-                logger
-                    .error(
-                        "Round-trip verification failed for chunk {} in file {} - decrypt error: {}",
-                        chunkIndex,
-                        filePath,
-                        roundTripError.getMessage(),
-                        roundTripError
-                    );
-            }
-
         } catch (Exception e) {
             throw new IOException("Failed to encrypt chunk " + chunkIndex + " in file " + filePath, e);
-        }
-    }
-
-    /**
-     * Converts byte array to hexadecimal string for logging.
-     * 
-     * @param bytes the byte array to convert
-     * @param maxBytes maximum number of bytes to convert (for log size control)
-     * @return hex string representation
-     */
-    private String bytesToHex(byte[] bytes, int maxBytes) {
-        if (bytes == null || bytes.length == 0) {
-            return "(empty)";
-        }
-
-        int bytesToShow = Math.min(bytes.length, maxBytes);
-        StringBuilder hex = new StringBuilder(bytesToShow * 2);
-        for (int i = 0; i < bytesToShow; i++) {
-            hex.append(String.format("%02x", bytes[i]));
-        }
-
-        if (bytes.length > maxBytes) {
-            hex.append("...").append(bytes.length - maxBytes).append("more");
-        }
-
-        return hex.toString();
-    }
-
-    /**
-     * Calculates SHA-256 hash of byte array for integrity verification.
-     * 
-     * @param bytes the byte array to hash
-     * @return SHA-256 hash as hex string
-     */
-    private String bytesToSha256(byte[] bytes) {
-        if (bytes == null || bytes.length == 0) {
-            return "sha256:(empty)";
-        }
-
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(bytes);
-            return "sha256:" + bytesToHex(hash, 8); // First 8 bytes of hash
-        } catch (NoSuchAlgorithmException e) {
-            logger.warn("SHA-256 not available for crypto verification", e);
-            return "sha256:(unavailable)";
         }
     }
 

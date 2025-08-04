@@ -59,26 +59,11 @@ public class CryptoChannelFactory implements ChannelFactory {
         String fileName = path.getFileName().toString();
         boolean shouldEncrypt = fileName.endsWith(".tlog");
 
-        // CRITICAL DEBUG: Log every channel creation
-        logger
-            .error(
-                "CRYPTO DEBUG: CryptoChannelFactory.open() - path={}, shouldEncrypt={}, options={}",
-                path,
-                shouldEncrypt,
-                Arrays.toString(options)
-            );
-
         if (shouldEncrypt) {
             // Wrap with crypto functionality using unified key resolver and exact UUID
             Set<OpenOption> optionsSet = new HashSet<>(Arrays.asList(options));
-
-            CryptoFileChannelWrapper wrapper = new CryptoFileChannelWrapper(baseChannel, keyIvResolver, path, optionsSet, translogUUID);
-
-            logger.error("CRYPTO DEBUG: Created CryptoFileChannelWrapper for path={}, headerSize={}", path, wrapper.getHeaderSize());
-
-            return wrapper;
+            return new CryptoFileChannelWrapper(baseChannel, keyIvResolver, path, optionsSet, translogUUID);
         } else {
-            logger.error("CRYPTO DEBUG: Using unwrapped channel for path={}", path);
             // Return unwrapped channel for non-encrypted files
             return baseChannel;
         }

@@ -89,8 +89,11 @@ public class CryptoTranslogEncryptionTests {
             "{\"@timestamp\": 894069207, \"clientip\":\"192.168.1.1\", \"request\": \"GET /secret/data HTTP/1.1\", \"status\": 200}";
         byte[] testData = sensitiveData.getBytes();
 
-        // Write header + data using our crypto channel
-        try (FileChannel cryptoChannel = channelFactory.open(translogPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+        // Write header + data using our crypto channel (with READ permission for round-trip verification)
+        try (
+            FileChannel cryptoChannel = channelFactory
+                .open(translogPath, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)
+        ) {
 
             // First write the header
             TranslogHeader header = new TranslogHeader(testTranslogUUID, 1L);
@@ -193,7 +196,10 @@ public class CryptoTranslogEncryptionTests {
 
         Path translogPath = tempDir.resolve("test-boundary.tlog");
 
-        try (FileChannel channel = channelFactory.open(translogPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+        try (
+            FileChannel channel = channelFactory
+                .open(translogPath, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)
+        ) {
             // Write header
             TranslogHeader header = new TranslogHeader(testTranslogUUID, 1L);
             header.write(channel, false);
