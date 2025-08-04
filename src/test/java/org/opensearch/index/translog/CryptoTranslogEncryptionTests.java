@@ -116,19 +116,18 @@ public class CryptoTranslogEncryptionTests {
         logger.info("File size: {} bytes", fileContent.length);
         logger.info("File content (first 200 chars): {}", fileContentString.substring(0, Math.min(200, fileContentString.length())));
 
-        // SECURITY ASSERTION: Sensitive data should NOT be readable in the file
         assertFalse(
-            "CRITICAL SECURITY FAILURE: Sensitive data found in plain text! File content: " + fileContentString,
+            "Sensitive data found in plain text! File content: " + fileContentString,
             fileContentString.contains("192.168.1.1")
         );
 
         assertFalse(
-            "CRITICAL SECURITY FAILURE: Sensitive data found in plain text! File content: " + fileContentString,
+            "Sensitive data found in plain text! File content: " + fileContentString,
             fileContentString.contains("/secret/data")
         );
 
         assertFalse(
-            "CRITICAL SECURITY FAILURE: JSON structure found in plain text! File content: " + fileContentString,
+            "JSON structure found in plain text! File content: " + fileContentString,
             fileContentString.contains("\"clientip\"")
         );
 
