@@ -13,14 +13,14 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.index.store.iv.KeyIvResolver;
 
 /**
- * A Translog implementation that provides AES-CTR encryption capabilities.
+ * A Translog implementation that provides AES-GCM encryption capabilities.
  * 
  * This class extends LocalTranslog and injects a CryptoChannelFactory during construction
  * to ensure that all translog file operations go through encrypted channels.
  *
- * Translog files (.tlog) are encrypted using AES-CTR with the same crypto
- * infrastructure as index files. Checkpoint files (.ckp) remain unencrypted
- * for performance and compatibility.
+ * Translog files (.tlog) are encrypted using AES-GCM with 8KB authenticated chunks.
+ * Each chunk includes a 16-byte authentication tag for data integrity verification.
+ * Checkpoint files (.ckp) remain unencrypted for performance and compatibility.
  *
  * Uses unified KeyIvResolver (same as index files) for consistent
  * key management across all encrypted components.
@@ -35,7 +35,7 @@ public class CryptoTranslog extends LocalTranslog {
     private final String translogUUID;
 
     /**
-     * Creates a new CryptoTranslog with AES-CTR encryption.
+     * Creates a new CryptoTranslog with AES-GCM encryption.
      *
      * @param config the translog configuration
      * @param translogUUID the translog UUID
@@ -82,7 +82,7 @@ public class CryptoTranslog extends LocalTranslog {
         this.keyIvResolver = keyIvResolver;
         this.translogUUID = translogUUID;
 
-        logger.info("CryptoTranslog initialized with AES-CTR encryption for translog: {}", translogUUID);
+        logger.info("CryptoTranslog initialized with AES-GCM encryption for translog: {}", translogUUID);
     }
 
     /**

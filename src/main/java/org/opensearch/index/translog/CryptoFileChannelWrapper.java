@@ -4,6 +4,8 @@
  */
 package org.opensearch.index.translog;
 
+import static org.opensearch.index.store.cipher.AesCipherFactory.computeOffsetIVForAesGcmEncrypted;
+
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
@@ -15,6 +17,7 @@ import java.nio.channels.ReadableByteChannel;
 import java.nio.channels.WritableByteChannel;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
+import java.security.Key;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -22,21 +25,33 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.codecs.CodecUtil;
-import org.opensearch.index.store.cipher.OpenSslNativeCipher;
+import org.opensearch.index.store.cipher.AesGcmCipherFactory;
 import org.opensearch.index.store.iv.KeyIvResolver;
 
 /**
- * A FileChannel wrapper that provides transparent AES-CTR encryption/decryption
- * for translog files with header-aware encryption.
+ * A FileChannel wrapper that provides transparent AES-GCM encryption/decryption
+ * for translog files using 8KB authenticated chunks.
  *
  * This approach ensures OpenSearch can read translog metadata while keeping
- * the actual translog operations encrypted.
+ * the actual translog operations encrypted with authentication.
+ *
+ * File Format:
+ * [TranslogHeader - Unencrypted]
+ * [Chunk 0: ≤8KB encrypted + 16B auth tag]
+ * [Chunk 1: ≤8KB encrypted + 16B auth tag]
+ * ...
+ * [Last Chunk: ≤8KB encrypted + 16B auth tag]
  *
  * @opensearch.internal
  */
 public class CryptoFileChannelWrapper extends FileChannel {
 
     private static final Logger logger = LogManager.getLogger(CryptoFileChannelWrapper.class);
+
+    // GCM chunk constants
+    private static final int GCM_CHUNK_SIZE = 8192;                                    // 8KB data per chunk
+    private static final int GCM_TAG_SIZE = AesGcmCipherFactory.GCM_TAG_LENGTH;       // 16 bytes auth tag
+    private static final int CHUNK_WITH_TAG_SIZE = GCM_CHUNK_SIZE + GCM_TAG_SIZE;     // 8208 bytes max
 
     private final FileChannel delegate;
     private final KeyIvResolver keyIvResolver;
@@ -46,12 +61,6 @@ public class CryptoFileChannelWrapper extends FileChannel {
     private final ReentrantReadWriteLock positionLock;
     private volatile boolean closed = false;
 
-    // Constants for better consistency
-    private static final int BUFFER_SIZE = 16_384;
-
-    // Thread-local buffer for efficient encryption/decryption operations
-    private static final ThreadLocal<byte[]> TEMP_BYTE_ARRAY = ThreadLocal.withInitial(() -> new byte[BUFFER_SIZE]);
-
     // Header size - calculated exactly using TranslogHeader.headerSizeInBytes()
     private volatile int actualHeaderSize = -1;
 
@@ -59,6 +68,21 @@ public class CryptoFileChannelWrapper extends FileChannel {
     private static final String TRANSLOG_CODEC = "translog";
     private static final int VERSION_PRIMARY_TERM = 3;
     private static final int CURRENT_VERSION = VERSION_PRIMARY_TERM;
+
+    /**
+     * Helper class for chunk position mapping
+     */
+    private static class ChunkInfo {
+        final int chunkIndex;           // Which chunk (0, 1, 2, ...)
+        final int offsetInChunk;        // Position within the 8KB chunk
+        final long diskPosition;        // Actual file position of chunk start
+
+        ChunkInfo(int chunkIndex, int offsetInChunk, long diskPosition) {
+            this.chunkIndex = chunkIndex;
+            this.offsetInChunk = offsetInChunk;
+            this.diskPosition = diskPosition;
+        }
+    }
 
     /**
      * Creates a new CryptoFileChannelWrapper that wraps the provided FileChannel.
@@ -135,6 +159,79 @@ public class CryptoFileChannelWrapper extends FileChannel {
         return size;
     }
 
+    /**
+     * Maps a file position to chunk information.
+     */
+    private ChunkInfo getChunkInfo(long filePosition) {
+        long dataPosition = filePosition - determineHeaderSize();
+        int chunkIndex = (int) (dataPosition / GCM_CHUNK_SIZE);
+        int offsetInChunk = (int) (dataPosition % GCM_CHUNK_SIZE);
+        long diskPosition = determineHeaderSize() + ((long) chunkIndex * CHUNK_WITH_TAG_SIZE);
+        return new ChunkInfo(chunkIndex, offsetInChunk, diskPosition);
+    }
+
+    /**
+     * Reads and decrypts a complete chunk from disk.
+     */
+    private byte[] readAndDecryptChunk(int chunkIndex) throws IOException {
+        try {
+            // Calculate disk position for this chunk
+            long diskPosition = determineHeaderSize() + ((long) chunkIndex * CHUNK_WITH_TAG_SIZE);
+
+            // Read encrypted chunk + tag from disk
+            ByteBuffer buffer = ByteBuffer.allocate(CHUNK_WITH_TAG_SIZE);
+            int bytesRead = delegate.read(buffer, diskPosition);
+            if (bytesRead <= GCM_TAG_SIZE) {
+                return new byte[0]; // Empty or invalid chunk
+            }
+
+            // Extract encrypted data with tag
+            byte[] encryptedWithTag = new byte[bytesRead];
+            buffer.flip();
+            buffer.get(encryptedWithTag);
+
+            // Use existing key management
+            Key key = keyIvResolver.getDataKey();
+            byte[] baseIV = keyIvResolver.getIvBytes();
+
+            // Use existing IV computation for this chunk
+            long chunkOffset = (long) chunkIndex * GCM_CHUNK_SIZE;
+            byte[] chunkIV = computeOffsetIVForAesGcmEncrypted(baseIV, chunkOffset);
+
+            // Use existing GCM decryption with authentication
+            return AesGcmCipherFactory.decryptWithTag(key, chunkIV, encryptedWithTag);
+
+        } catch (Exception e) {
+            throw new IOException("Failed to decrypt chunk " + chunkIndex, e);
+        }
+    }
+
+    /**
+     * Encrypts and writes a complete chunk to disk.
+     */
+    private void encryptAndWriteChunk(int chunkIndex, byte[] plainData) throws IOException {
+        try {
+            // Use existing key management
+            Key key = keyIvResolver.getDataKey();
+            byte[] baseIV = keyIvResolver.getIvBytes();
+
+            // Use existing IV computation for this chunk
+            long chunkOffset = (long) chunkIndex * GCM_CHUNK_SIZE;
+            byte[] chunkIV = computeOffsetIVForAesGcmEncrypted(baseIV, chunkOffset);
+
+            // Use existing GCM encryption (includes authentication tag)
+            byte[] encryptedWithTag = AesGcmCipherFactory.encryptWithTag(key, chunkIV, plainData, plainData.length);
+
+            // Write to disk at chunk position
+            long diskPosition = determineHeaderSize() + ((long) chunkIndex * CHUNK_WITH_TAG_SIZE);
+            ByteBuffer buffer = ByteBuffer.wrap(encryptedWithTag);
+            delegate.write(buffer, diskPosition);
+
+        } catch (Exception e) {
+            throw new IOException("Failed to encrypt chunk " + chunkIndex, e);
+        }
+    }
+
     @Override
     public int read(ByteBuffer dst) throws IOException {
         return read(dst, position.get());
@@ -143,144 +240,39 @@ public class CryptoFileChannelWrapper extends FileChannel {
     @Override
     public int read(ByteBuffer dst, long position) throws IOException {
         ensureOpen();
-
         if (dst.remaining() == 0) {
             return 0;
         }
 
         positionLock.writeLock().lock();
         try {
-            // Read data from delegate
-            int bytesRead = delegate.read(dst, position);
-            if (bytesRead <= 0) {
-                return bytesRead;
-            }
-
             // Update position tracking for non-position-specific reads
             if (position == this.position.get()) {
-                this.position.addAndGet(bytesRead);
+                this.position.addAndGet(dst.remaining());
             }
 
-            // Determine header size
             int headerSize = determineHeaderSize();
 
-            // If this read is entirely within the header, no decryption needed
-            if (position + bytesRead <= headerSize) {
-                return bytesRead;
+            // Header reads remain unchanged
+            if (position < headerSize) {
+                return delegate.read(dst, position);
             }
 
-            // If this read starts within the header but extends beyond it
-            if (position < headerSize && position + bytesRead > headerSize) {
-                // Only decrypt the portion beyond the header
-                int headerPortion = (int) (headerSize - position);
-                int encryptedPortion = bytesRead - headerPortion;
+            // Chunk-based reading for encrypted data
+            ChunkInfo chunkInfo = getChunkInfo(position);
 
-                if (encryptedPortion > 0) {
-                    // Get the encrypted data portion using ThreadLocal buffer
-                    byte[] encryptedData = getTempByteArray(encryptedPortion);
-                    int originalPosition = dst.position();
-                    dst.position(originalPosition - encryptedPortion);
-                    dst.get(encryptedData, 0, encryptedPortion);
+            // Read and decrypt the needed chunk
+            byte[] decryptedChunk = readAndDecryptChunk(chunkInfo.chunkIndex);
 
-                    // Decrypt the data using unified key resolver
-                    try {
-                        byte[] key = keyIvResolver.getDataKey().getEncoded();
-                        byte[] iv = keyIvResolver.getIvBytes();
-                        long encryptedPosition = position + headerPortion;
+            // Extract requested data from decrypted chunk
+            int available = Math.max(0, decryptedChunk.length - chunkInfo.offsetInChunk);
+            int toRead = Math.min(dst.remaining(), available);
 
-                        // END-TO-END TEST: Log encrypted data read from disk
-                        logger
-                            .error(
-                                "DECRYPT TEST: read boundary - pos={}, size={}, encrypted=[{}]",
-                                encryptedPosition,
-                                encryptedPortion,
-                                dataToHex(encryptedData, 16)
-                            );
-
-                        // Create exact-sized array for decryption (OpenSslNativeCipher requires exact size)
-                        byte[] exactEncryptedData = java.util.Arrays.copyOf(encryptedData, encryptedPortion);
-                        byte[] decryptedData = OpenSslNativeCipher.decrypt(key, iv, exactEncryptedData, encryptedPosition);
-
-                        // END-TO-END TEST: Log decrypted data after decryption
-                        logger
-                            .error(
-                                "DECRYPT TEST: read boundary - pos={}, size={}, decrypted=[{}]",
-                                encryptedPosition,
-                                encryptedPortion,
-                                dataToHex(decryptedData, 16)
-                            );
-
-                        // Put the decrypted data back into the buffer
-                        dst.position(originalPosition - encryptedPortion);
-                        dst.put(decryptedData);
-
-                        // Clear sensitive data
-                        clearSensitiveData(encryptedData, encryptedPortion);
-                        clearSensitiveData(exactEncryptedData, exactEncryptedData.length);
-                        clearSensitiveData(decryptedData, decryptedData.length);
-                    } catch (Throwable e) {
-                        logger.error("CRYPTO DEBUG: read() decrypt FAILED at pos={}", position + headerPortion, e);
-                        // Clear sensitive data even on error
-                        clearSensitiveData(encryptedData, encryptedPortion);
-                        throw new IOException("Failed to decrypt data at position " + (position + headerPortion), e);
-                    }
-                }
-
-                return bytesRead;
+            if (toRead > 0) {
+                dst.put(decryptedChunk, chunkInfo.offsetInChunk, toRead);
             }
 
-            // If this read is entirely beyond the header, decrypt all of it
-            if (position >= headerSize) {
-                try {
-                    // Get the data that was just read using ThreadLocal buffer
-                    byte[] encryptedData = getTempByteArray(bytesRead);
-                    int originalPosition = dst.position();
-                    dst.position(originalPosition - bytesRead);
-                    dst.get(encryptedData, 0, bytesRead);
-
-                    // Decrypt the data using unified key resolver
-                    byte[] key = keyIvResolver.getDataKey().getEncoded();
-                    byte[] iv = keyIvResolver.getIvBytes();
-
-                    // END-TO-END TEST: Log encrypted data read from disk
-                    logger
-                        .error(
-                            "DECRYPT TEST: read full - pos={}, size={}, encrypted=[{}]",
-                            position,
-                            bytesRead,
-                            dataToHex(encryptedData, 16)
-                        );
-
-                    // Create exact-sized array for decryption
-                    byte[] exactEncryptedData = java.util.Arrays.copyOf(encryptedData, bytesRead);
-                    byte[] decryptedData = OpenSslNativeCipher.decrypt(key, iv, exactEncryptedData, position);
-
-                    // END-TO-END TEST: Log decrypted data after decryption
-                    logger
-                        .error(
-                            "DECRYPT TEST: read full - pos={}, size={}, decrypted=[{}]",
-                            position,
-                            bytesRead,
-                            dataToHex(decryptedData, 16)
-                        );
-
-                    // Put the decrypted data back into the buffer
-                    dst.position(originalPosition - bytesRead);
-                    dst.put(decryptedData);
-
-                    // Clear sensitive data
-                    clearSensitiveData(encryptedData, bytesRead);
-                    clearSensitiveData(exactEncryptedData, exactEncryptedData.length);
-                    clearSensitiveData(decryptedData, decryptedData.length);
-
-                    return bytesRead;
-                } catch (Throwable e) {
-                    logger.error("CRYPTO DEBUG: read() decrypt FAILED at pos={}", position, e);
-                    throw new IOException("Failed to decrypt data at position " + position, e);
-                }
-            }
-
-            return bytesRead;
+            return toRead;
         } finally {
             positionLock.writeLock().unlock();
         }
@@ -324,185 +316,41 @@ public class CryptoFileChannelWrapper extends FileChannel {
     @Override
     public int write(ByteBuffer src, long position) throws IOException {
         ensureOpen();
-
         if (src.remaining() == 0) {
             return 0;
         }
 
         positionLock.writeLock().lock();
         try {
-            // Determine header size
             int headerSize = determineHeaderSize();
 
-            // If this write is entirely within the header, no encryption needed
-            if (position + src.remaining() <= headerSize) {
+            // Header writes remain unchanged
+            if (position < headerSize) {
                 return delegate.write(src, position);
             }
 
-            // If this write starts within the header but extends beyond it
-            if (position < headerSize && position + src.remaining() > headerSize) {
-                // Split the write into header and data portions
-                int headerPortion = (int) (headerSize - position);
-                int dataPortion = src.remaining() - headerPortion;
+            // Chunk-based encrypted writes
+            ChunkInfo chunkInfo = getChunkInfo(position);
 
-                // Write header portion without encryption
-                ByteBuffer headerBuffer = ByteBuffer.allocate(headerPortion);
-                src.get(headerBuffer.array());
-                headerBuffer.flip();
-                int headerBytesWritten = delegate.write(headerBuffer, position);
+            // Read-modify-write chunk pattern
+            byte[] existingChunk = readAndDecryptChunk(chunkInfo.chunkIndex);
 
-                // Write data portion with encryption
-                if (dataPortion > 0 && headerBytesWritten == headerPortion) {
-                    // Use ThreadLocal buffer for plain data
-                    byte[] plainData = getTempByteArray(dataPortion);
-                    src.get(plainData, 0, dataPortion);
-
-                    // Encrypt the data using unified key resolver
-                    try {
-                        byte[] key = keyIvResolver.getDataKey().getEncoded();
-                        byte[] iv = keyIvResolver.getIvBytes();
-                        long encryptedPosition = position + headerPortion;
-
-                        // END-TO-END TEST: Log plaintext data before encryption
-                        logger
-                            .error(
-                                "ENCRYPT TEST: write boundary - pos={}, size={}, plaintext=[{}]",
-                                encryptedPosition,
-                                dataPortion,
-                                dataToHex(plainData, 16)
-                            );
-
-                        // Create exact-sized array for encryption
-                        byte[] exactPlainData = java.util.Arrays.copyOf(plainData, dataPortion);
-                        byte[] encryptedData = OpenSslNativeCipher.encrypt(key, iv, exactPlainData, encryptedPosition);
-
-                        // END-TO-END TEST: Log encrypted data after encryption
-                        logger
-                            .error(
-                                "ENCRYPT TEST: write boundary - pos={}, size={}, encrypted=[{}]",
-                                encryptedPosition,
-                                dataPortion,
-                                dataToHex(encryptedData, 16)
-                            );
-
-                        // ROUND-TRIP TEST: Immediately test decryption to verify integrity
-                        try {
-                            byte[] testDecrypted = OpenSslNativeCipher.decrypt(key, iv, encryptedData, encryptedPosition);
-                            boolean roundTripOK = java.util.Arrays.equals(exactPlainData, testDecrypted);
-                            logger
-                                .error(
-                                    "ROUND-TRIP TEST: write boundary - pos={}, size={}, success=[{}]",
-                                    encryptedPosition,
-                                    dataPortion,
-                                    roundTripOK
-                                );
-                            if (!roundTripOK) {
-                                logger
-                                    .error(
-                                        "ROUND-TRIP FAILURE: Original=[{}], Decrypted=[{}]",
-                                        dataToHex(exactPlainData, 16),
-                                        dataToHex(testDecrypted, 16)
-                                    );
-                            }
-                            clearSensitiveData(testDecrypted, testDecrypted.length);
-                        } catch (Exception rtException) {
-                            logger
-                                .error(
-                                    "ROUND-TRIP ERROR: write boundary - pos={}, size={}, error={}",
-                                    encryptedPosition,
-                                    dataPortion,
-                                    rtException.getMessage()
-                                );
-                        }
-
-                        // Write the encrypted data
-                        ByteBuffer encryptedBuffer = ByteBuffer.wrap(encryptedData);
-                        int dataBytesWritten = delegate.write(encryptedBuffer, encryptedPosition);
-
-                        // Clear sensitive data
-                        clearSensitiveData(plainData, dataPortion);
-                        clearSensitiveData(exactPlainData, exactPlainData.length);
-
-                        return headerBytesWritten + dataBytesWritten;
-                    } catch (Throwable e) {
-                        logger.error("CRYPTO DEBUG: write() encrypt FAILED at pos={}", position + headerPortion, e);
-                        // Clear sensitive data even on error
-                        clearSensitiveData(plainData, dataPortion);
-                        throw new IOException("Failed to encrypt data at position " + (position + headerPortion), e);
-                    }
-                }
-
-                return headerBytesWritten;
+            // Expand chunk buffer if needed
+            int requiredSize = chunkInfo.offsetInChunk + src.remaining();
+            byte[] modifiedChunk = existingChunk;
+            if (existingChunk.length < requiredSize) {
+                modifiedChunk = new byte[Math.min(requiredSize, GCM_CHUNK_SIZE)];
+                System.arraycopy(existingChunk, 0, modifiedChunk, 0, existingChunk.length);
             }
 
-            // If this write is entirely beyond the header, encrypt all of it
-            if (position >= headerSize) {
-                try {
-                    // Get the data to encrypt using ThreadLocal buffer
-                    int dataSize = src.remaining();
-                    byte[] plainData = getTempByteArray(dataSize);
-                    src.get(plainData, 0, dataSize);
+            // Apply modifications
+            int bytesToWrite = Math.min(src.remaining(), GCM_CHUNK_SIZE - chunkInfo.offsetInChunk);
+            src.get(modifiedChunk, chunkInfo.offsetInChunk, bytesToWrite);
 
-                    // Encrypt the data using unified key resolver
-                    byte[] key = keyIvResolver.getDataKey().getEncoded();
-                    byte[] iv = keyIvResolver.getIvBytes();
+            // Encrypt and write back
+            encryptAndWriteChunk(chunkInfo.chunkIndex, modifiedChunk);
 
-                    // END-TO-END TEST: Log plaintext data before encryption
-                    logger
-                        .error("ENCRYPT TEST: write full - pos={}, size={}, plaintext=[{}]", position, dataSize, dataToHex(plainData, 16));
-
-                    // Create exact-sized array for encryption
-                    byte[] exactPlainData = java.util.Arrays.copyOf(plainData, dataSize);
-                    byte[] encryptedData = OpenSslNativeCipher.encrypt(key, iv, exactPlainData, position);
-
-                    // END-TO-END TEST: Log encrypted data after encryption
-                    logger
-                        .error(
-                            "ENCRYPT TEST: write full - pos={}, size={}, encrypted=[{}]",
-                            position,
-                            dataSize,
-                            dataToHex(encryptedData, 16)
-                        );
-
-                    // ROUND-TRIP TEST: Immediately test decryption to verify integrity
-                    try {
-                        byte[] testDecrypted = OpenSslNativeCipher.decrypt(key, iv, encryptedData, position);
-                        boolean roundTripOK = java.util.Arrays.equals(exactPlainData, testDecrypted);
-                        logger.error("ROUND-TRIP TEST: write full - pos={}, size={}, success=[{}]", position, dataSize, roundTripOK);
-                        if (!roundTripOK) {
-                            logger
-                                .error(
-                                    "ROUND-TRIP FAILURE: Original=[{}], Decrypted=[{}]",
-                                    dataToHex(exactPlainData, 16),
-                                    dataToHex(testDecrypted, 16)
-                                );
-                        }
-                        clearSensitiveData(testDecrypted, testDecrypted.length);
-                    } catch (Exception rtException) {
-                        logger
-                            .error(
-                                "ROUND-TRIP ERROR: write full - pos={}, size={}, error={}",
-                                position,
-                                dataSize,
-                                rtException.getMessage()
-                            );
-                    }
-
-                    // Write the encrypted data
-                    ByteBuffer encryptedBuffer = ByteBuffer.wrap(encryptedData);
-                    int bytesWritten = delegate.write(encryptedBuffer, position);
-
-                    // Clear sensitive data
-                    clearSensitiveData(plainData, dataSize);
-                    clearSensitiveData(exactPlainData, exactPlainData.length);
-
-                    return bytesWritten;
-                } catch (Throwable e) {
-                    logger.error("CRYPTO DEBUG: write() encrypt FAILED at pos={}", position, e);
-                    throw new IOException("Failed to encrypt data at position " + position, e);
-                }
-            }
-            return delegate.write(src, position);
+            return bytesToWrite;
         } finally {
             positionLock.writeLock().unlock();
         }
@@ -577,7 +425,7 @@ public class CryptoFileChannelWrapper extends FileChannel {
         // For encrypted files, we need to decrypt data during transfer
         long transferred = 0;
         long remaining = count;
-        ByteBuffer buffer = ByteBuffer.allocate(8192);
+        ByteBuffer buffer = ByteBuffer.allocate(GCM_CHUNK_SIZE);
 
         while (remaining > 0 && transferred < count) {
             buffer.clear();
@@ -609,7 +457,7 @@ public class CryptoFileChannelWrapper extends FileChannel {
         // For encrypted files, we need to encrypt data during transfer
         long transferred = 0;
         long remaining = count;
-        ByteBuffer buffer = ByteBuffer.allocate(8192);
+        ByteBuffer buffer = ByteBuffer.allocate(GCM_CHUNK_SIZE);
 
         while (remaining > 0 && transferred < count) {
             buffer.clear();
@@ -689,60 +537,5 @@ public class CryptoFileChannelWrapper extends FileChannel {
      */
     public int getHeaderSize() {
         return determineHeaderSize();
-    }
-
-    /**
-     * Gets a temporary byte array from ThreadLocal storage, expanding if needed.
-     * This reduces GC pressure by reusing arrays across operations.
-     *
-     * @param minSize the minimum required size
-     * @return a byte array of at least minSize capacity
-     */
-    private static byte[] getTempByteArray(int minSize) {
-        byte[] array = TEMP_BYTE_ARRAY.get();
-        if (array.length < minSize) {
-            // Expand the array, use next power of 2 or minSize, whichever is larger
-            int newSize = Math.max(minSize, Integer.highestOneBit(minSize - 1) << 1);
-            array = new byte[newSize];
-            TEMP_BYTE_ARRAY.set(array);
-        }
-        return array;
-    }
-
-    /**
-     * Clears sensitive data from the temporary array after use.
-     * This ensures encryption keys and plaintext don't linger in memory.
-     *
-     * @param array the array to clear
-     * @param length the number of bytes to clear from the start
-     */
-    private static void clearSensitiveData(byte[] array, int length) {
-        if (array != null && length > 0) {
-            int clearLength = Math.min(length, array.length);
-            java.util.Arrays.fill(array, 0, clearLength, (byte) 0);
-        }
-    }
-
-    /**
-     * Helper method to convert data to hex string for end-to-end testing.
-     * Shows first 16 bytes of actual data being encrypted/decrypted.
-     */
-    private static String dataToHex(byte[] data, int maxBytes) {
-        if (data == null || data.length == 0) {
-            return "[empty]";
-        }
-        int bytesToShow = Math.min(maxBytes, data.length);
-        StringBuilder hex = new StringBuilder();
-        for (int i = 0; i < bytesToShow; i++) {
-            String hexByte = Integer.toHexString(0xFF & data[i]);
-            if (hexByte.length() == 1) {
-                hex.append('0');
-            }
-            hex.append(hexByte);
-        }
-        if (data.length > maxBytes) {
-            hex.append("...[+").append(data.length - maxBytes).append(" more]");
-        }
-        return hex.toString();
     }
 }
