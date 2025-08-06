@@ -264,7 +264,23 @@ public class CryptoFileChannelWrapper extends FileChannel {
 
     @Override
     public int read(ByteBuffer dst) throws IOException {
-        return read(dst, position.get());
+        ensureOpen();
+        if (dst.remaining() == 0) {
+            return 0;
+        }
+
+        // updates channel position, needs writeLock for position update
+        positionLock.writeLock().lock();
+        try {
+            long currentPosition = position.get();
+            int bytesRead = readAtPosition(dst, currentPosition);
+            if (bytesRead > 0) {
+                position.addAndGet(bytesRead);
+            }
+            return bytesRead;
+        } finally {
+            positionLock.writeLock().unlock();
+        }
     }
 
     @Override
@@ -274,38 +290,42 @@ public class CryptoFileChannelWrapper extends FileChannel {
             return 0;
         }
 
-        positionLock.writeLock().lock();
+        // Positional read: does NOT update channel position, can use readLock for better concurrency
+        positionLock.readLock().lock();
         try {
-            // Update position tracking for non-position-specific reads
-            if (position == this.position.get()) {
-                this.position.addAndGet(dst.remaining());
-            }
-
-            int headerSize = determineHeaderSize();
-
-            // Header reads remain unchanged
-            if (position < headerSize) {
-                return delegate.read(dst, position);
-            }
-
-            // Chunk-based reading for encrypted data
-            ChunkInfo chunkInfo = getChunkInfo(position);
-
-            // Read and decrypt the needed chunk
-            byte[] decryptedChunk = readAndDecryptChunk(chunkInfo.chunkIndex);
-
-            // Extract requested data from decrypted chunk
-            int available = Math.max(0, decryptedChunk.length - chunkInfo.offsetInChunk);
-            int toRead = Math.min(dst.remaining(), available);
-
-            if (toRead > 0) {
-                dst.put(decryptedChunk, chunkInfo.offsetInChunk, toRead);
-            }
-
-            return toRead;
+            return readAtPosition(dst, position);
         } finally {
-            positionLock.writeLock().unlock();
+            positionLock.readLock().unlock();
         }
+    }
+
+    /**
+     * Internal method to read from a specific position without updating the channel position.
+     * This method is used by both stateful and positional read methods.
+     */
+    private int readAtPosition(ByteBuffer dst, long position) throws IOException {
+        int headerSize = determineHeaderSize();
+
+        // Header reads remain unchanged
+        if (position < headerSize) {
+            return delegate.read(dst, position);
+        }
+
+        // Chunk-based reading for encrypted data
+        ChunkInfo chunkInfo = getChunkInfo(position);
+
+        // Read and decrypt the needed chunk
+        byte[] decryptedChunk = readAndDecryptChunk(chunkInfo.chunkIndex);
+
+        // Extract requested data from decrypted chunk
+        int available = Math.max(0, decryptedChunk.length - chunkInfo.offsetInChunk);
+        int toRead = Math.min(dst.remaining(), available);
+
+        if (toRead > 0) {
+            dst.put(decryptedChunk, chunkInfo.offsetInChunk, toRead);
+        }
+
+        return toRead;
     }
 
     @Override
