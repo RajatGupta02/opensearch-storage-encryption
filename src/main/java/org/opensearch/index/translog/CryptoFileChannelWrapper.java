@@ -282,13 +282,4 @@ public class CryptoFileChannelWrapper extends FileChannel {
             throw new ClosedChannelException();
         }
     }
-
-    /**
-     * Gets the underlying delegate FileChannel.
-     *
-     * @return the delegate FileChannel
-     */
-    public FileChannel getDelegate() {
-        return delegate;
-    }
 }
