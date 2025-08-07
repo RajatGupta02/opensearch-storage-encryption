@@ -87,6 +87,60 @@ public class CryptoTranslog extends LocalTranslog {
     }
 
     /**
+     * Creates a new CryptoTranslog with AES-GCM encryption and custom TranslogOperationHelper.
+     *
+     * @param config the translog configuration
+     * @param translogUUID the translog UUID
+     * @param deletionPolicy the deletion policy
+     * @param globalCheckpointSupplier the global checkpoint supplier
+     * @param primaryTermSupplier the primary term supplier
+     * @param persistedSequenceNumberConsumer the persisted sequence number consumer
+     * @param translogOperationHelper the translog operation helper
+     * @param keyIvResolver the key and IV resolver for encryption (unified with index files)
+     * @throws IOException if translog creation fails
+     */
+    public CryptoTranslog(
+        TranslogConfig config,
+        String translogUUID,
+        TranslogDeletionPolicy deletionPolicy,
+        LongSupplier globalCheckpointSupplier,
+        LongSupplier primaryTermSupplier,
+        LongConsumer persistedSequenceNumberConsumer,
+        TranslogOperationHelper translogOperationHelper,
+        KeyIvResolver keyIvResolver
+    )
+        throws IOException {
+
+        super(
+            config,
+            translogUUID,
+            deletionPolicy,
+            globalCheckpointSupplier,
+            primaryTermSupplier,
+            persistedSequenceNumberConsumer,
+            translogOperationHelper,
+            createCryptoChannelFactory(keyIvResolver, translogUUID)
+        );
+
+        // Strict validation after super() - never allow null components
+        if (keyIvResolver == null || translogUUID == null) {
+            throw new IllegalArgumentException(
+                "Cannot create CryptoTranslog without keyIvResolver and translogUUID. "
+                    + "Required for translog encryption. keyIvResolver="
+                    + keyIvResolver
+                    + ", translogUUID="
+                    + translogUUID
+            );
+        }
+
+        // Initialize instance fields
+        this.keyIvResolver = keyIvResolver;
+        this.translogUUID = translogUUID;
+
+        logger.info("CryptoTranslog initialized for translog: {}", translogUUID);
+    }
+
+    /**
      * Helper method to create CryptoChannelFactory for constructor use.
      * This is needed because Java requires super() to be the first statement.
      * Returns ChannelFactory interface type to match LocalTranslog constructor signature.
