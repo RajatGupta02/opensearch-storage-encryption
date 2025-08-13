@@ -59,8 +59,8 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
         this.keyProvider = keyProvider;
 
         // Initialize cache with settings
-        int ttlSeconds = settings.getAsInt("kms.data_key_cache_ttl_seconds", 300);
-        int maxSize = settings.getAsInt("kms.data_key_cache_max_size", 100);
+        int ttlSeconds = settings.getAsInt("index.store.kms.data_key_cache_ttl_seconds", 300);
+        int maxSize = settings.getAsInt("index.store.kms.data_key_cache_max_size", 100);
         this.dataKeyCache = new DataKeyCache(ttlSeconds * 1000L, maxSize);
 
         initialize();

@@ -76,13 +76,13 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
      * Specifies the TTL for cached data keys in seconds. Default is 300 seconds (5 minutes).
      */
     public static final Setting<Integer> KMS_DATA_KEY_CACHE_TTL_SECONDS_SETTING = Setting
-        .intSetting("kms.data_key_cache_ttl_seconds", 300, 1, Property.NodeScope, Property.IndexScope);
+        .intSetting("index.store.kms.data_key_cache_ttl_seconds", 300, 1, Property.NodeScope, Property.IndexScope);
 
     /**
      * Specifies the maximum number of data keys to cache. Default is 100, set to 0 for unlimited.
      */
     public static final Setting<Integer> KMS_DATA_KEY_CACHE_MAX_SIZE_SETTING = Setting
-        .intSetting("kms.data_key_cache_max_size", 100, 0, Property.NodeScope, Property.IndexScope);
+        .intSetting("index.store.kms.data_key_cache_max_size", 100, 0, Property.NodeScope, Property.IndexScope);
 
     MasterKeyProvider getKeyProvider(IndexSettings indexSettings) {
         final String KEY_PROVIDER_TYPE = indexSettings.getValue(INDEX_KMS_TYPE_SETTING);
@@ -128,8 +128,8 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
         // Build settings for cache configuration
         Settings cacheSettings = Settings
             .builder()
-            .put("kms.data_key_cache_ttl_seconds", indexSettings.getValue(KMS_DATA_KEY_CACHE_TTL_SECONDS_SETTING))
-            .put("kms.data_key_cache_max_size", indexSettings.getValue(KMS_DATA_KEY_CACHE_MAX_SIZE_SETTING))
+            .put("index.store.kms.data_key_cache_ttl_seconds", indexSettings.getValue(KMS_DATA_KEY_CACHE_TTL_SECONDS_SETTING))
+            .put("index.store.kms.data_key_cache_max_size", indexSettings.getValue(KMS_DATA_KEY_CACHE_MAX_SIZE_SETTING))
             .build();
 
         KeyIvResolver keyIvResolver = new DefaultKeyIvResolver(baseDir, provider, getKeyProvider(indexSettings), cacheSettings);

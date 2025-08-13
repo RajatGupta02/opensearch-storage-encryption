@@ -17,10 +17,10 @@ Two new configuration settings are available:
 
 ```yaml
 # TTL for cached data keys in seconds (default: 300 = 5 minutes)
-kms.data_key_cache_ttl_seconds: 300
+index.store.kms.data_key_cache_ttl_seconds: 300
 
 # Maximum number of keys to cache (default: 100, set to 0 for unlimited)
-kms.data_key_cache_max_size: 100
+index.store.kms.data_key_cache_max_size: 100
 ```
 
 ### Example Configuration
