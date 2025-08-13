@@ -37,7 +37,7 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
 
     private final Directory directory;
     private final MasterKeyProvider keyProvider;
-    private final DataKeyCache dataKeyCache;
+    private final CaffeineDataKeyCache dataKeyCache;
 
     private String iv;
 
@@ -61,7 +61,7 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
         // Initialize cache with settings
         int ttlSeconds = settings.getAsInt("index.store.kms.data_key_cache_ttl_seconds", 300);
         int maxSize = settings.getAsInt("index.store.kms.data_key_cache_max_size", 100);
-        this.dataKeyCache = new DataKeyCache(ttlSeconds * 1000L, maxSize);
+        this.dataKeyCache = new CaffeineDataKeyCache(ttlSeconds * 1000L, maxSize);
 
         initialize();
     }
@@ -200,7 +200,7 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
      *
      * @return cache statistics
      */
-    public DataKeyCache.CacheStats getCacheStats() {
+    public CaffeineDataKeyCache.CacheStatistics getCacheStats() {
         return dataKeyCache != null ? dataKeyCache.getStats() : null;
     }
 

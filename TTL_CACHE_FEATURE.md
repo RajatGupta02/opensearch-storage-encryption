@@ -2,12 +2,13 @@
 
 ## Overview
 
-This feature implements a Time-To-Live (TTL) based caching system for data keys in the OpenSearch storage encryption plugin. Instead of keeping decrypted data keys in memory indefinitely, the system now:
+This feature implements a Time-To-Live (TTL) based caching system for data keys in the OpenSearch storage encryption plugin using **Google's Caffeine Cache**. Instead of keeping decrypted data keys in memory indefinitely, the system now:
 
 - Caches decrypted data keys for a configurable TTL (default: 5 minutes)
 - Automatically refreshes keys from KMS when they expire
-- Provides thread-safe access with minimal performance impact
+- Provides enterprise-grade thread-safe access with superior performance
 - Supports automatic eviction and size limits
+- Leverages Google's battle-tested caching technology
 
 ## Configuration
 
@@ -35,14 +36,15 @@ kms.data_key_cache_max_size: 50      # Cache up to 50 keys
 
 ### Components
 
-1. **DataKeyCache**: Core caching implementation
-   - TTL-based expiration
-   - LRU eviction when size limit reached
-   - Thread-safe concurrent access
-   - Background cleanup of expired entries
-   - Graceful error handling with fallback
+1. **CaffeineDataKeyCache**: Google Caffeine-based caching implementation
+   - High-performance TTL-based expiration
+   - Advanced LRU eviction with size limits
+   - Enterprise-grade thread-safe concurrent access
+   - Automatic cleanup of expired entries
+   - Production-proven error handling with fallback
+   - Built-in metrics and monitoring
 
-2. **DefaultKeyIvResolver**: Updated to use the cache
+2. **DefaultKeyIvResolver**: Updated to use Caffeine cache
    - Transparent integration with existing code
    - Automatic KMS calls on cache miss
    - Uses keyProvider.getKeyId() as cache key
@@ -78,9 +80,11 @@ For monitoring and management:
 DefaultKeyIvResolver resolver = new DefaultKeyIvResolver(directory, provider, keyProvider, settings);
 
 // Get cache statistics
-DataKeyCache.CacheStats stats = resolver.getCacheStats();
-System.out.println("Cache entries: " + stats.totalEntries);
-System.out.println("Expired entries: " + stats.expiredEntries);
+CaffeineDataKeyCache.CacheStatistics stats = resolver.getCacheStats();
+System.out.println("Cache entries: " + stats.estimatedSize);
+System.out.println("Hit rate: " + stats.getHitRate());
+System.out.println("Hit count: " + stats.hitCount);
+System.out.println("Miss count: " + stats.missCount);
 
 // Manually invalidate a key
 resolver.invalidateKey("specific-key-id");

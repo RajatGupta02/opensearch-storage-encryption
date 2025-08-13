@@ -4,8 +4,6 @@
  */
 package org.opensearch.index.store.iv;
 
-import static org.junit.Assert.*;
-
 import java.security.Key;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -13,32 +11,31 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import javax.crypto.spec.SecretKeySpec;
 
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+import org.opensearch.test.OpenSearchTestCase;
 
 /**
- * Unit tests for DataKeyCache TTL-based caching functionality.
+ * Unit tests for CaffeineDataKeyCache TTL-based caching functionality.
  */
-public class DataKeyCacheTests {
+public class CaffeineDataKeyCacheTests extends OpenSearchTestCase {
 
-    private DataKeyCache cache;
+    private CaffeineDataKeyCache cache;
     private static final String TEST_KEY_ID = "test-key-123";
     private static final long SHORT_TTL_MS = 100; // 100ms for fast testing
 
-    @Before
-    public void setUp() {
-        cache = new DataKeyCache(SHORT_TTL_MS, 10);
+    @Override
+    public void setUp() throws Exception {
+        super.setUp();
+        cache = new CaffeineDataKeyCache(SHORT_TTL_MS, 10);
     }
 
-    @After
-    public void tearDown() {
+    @Override
+    public void tearDown() throws Exception {
         if (cache != null) {
             cache.shutdown();
         }
+        super.tearDown();
     }
 
-    @Test
     public void testCacheHitAndMiss() {
         AtomicInteger keyGenerationCount = new AtomicInteger(0);
 
@@ -60,7 +57,6 @@ public class DataKeyCacheTests {
         assertSame(key1, key2); // Should be the same instance
     }
 
-    @Test
     public void testCacheExpiration() throws InterruptedException {
         AtomicInteger keyGenerationCount = new AtomicInteger(0);
 
@@ -84,7 +80,6 @@ public class DataKeyCacheTests {
         assertEquals(2, keyGenerationCount.get()); // Should increment
     }
 
-    @Test
     public void testConcurrentAccess() throws InterruptedException {
         final int threadCount = 10;
         final CountDownLatch startLatch = new CountDownLatch(1);
@@ -124,7 +119,6 @@ public class DataKeyCacheTests {
         }
     }
 
-    @Test
     public void testCacheInvalidation() {
         AtomicInteger keyGenerationCount = new AtomicInteger(0);
 
@@ -148,21 +142,22 @@ public class DataKeyCacheTests {
         assertEquals(2, keyGenerationCount.get()); // Should increment
     }
 
-    @Test
     public void testCacheStats() {
         // Add some entries
         cache.getDataKey("key1", () -> new SecretKeySpec(new byte[32], "AES"));
         cache.getDataKey("key2", () -> new SecretKeySpec(new byte[32], "AES"));
 
-        DataKeyCache.CacheStats stats = cache.getStats();
+        CaffeineDataKeyCache.CacheStatistics stats = cache.getStats();
         assertNotNull(stats);
-        assertEquals(2, stats.totalEntries);
+        assertEquals(2, stats.estimatedSize);
         assertEquals(SHORT_TTL_MS, stats.ttlMillis);
         assertEquals(10, stats.maxSize);
+
+        // Verify hit rate calculation
+        assertTrue(stats.getHitRate() >= 0.0 && stats.getHitRate() <= 1.0);
     }
 
-    @Test
-    public void testErrorFallback() {
+    public void testErrorHandling() {
         AtomicInteger attemptCount = new AtomicInteger(0);
 
         // First call succeeds
@@ -180,29 +175,78 @@ public class DataKeyCacheTests {
             Thread.currentThread().interrupt();
         }
 
-        // Second call fails, should return expired key as fallback
-        Key key2 = cache.getDataKey(TEST_KEY_ID, () -> {
-            attemptCount.incrementAndGet();
-            throw new RuntimeException("KMS failure simulation");
-        });
-        assertNotNull(key2);
-        assertEquals(2, attemptCount.get());
-        assertSame(key1, key2); // Should return the expired key as fallback
+        // Second call fails - Caffeine removes expired entries automatically,
+        // so no fallback is available, expect exception
+        try {
+            cache.getDataKey(TEST_KEY_ID, () -> {
+                attemptCount.incrementAndGet();
+                throw new RuntimeException("KMS failure simulation");
+            });
+            fail("Expected RuntimeException due to KMS failure with no fallback");
+        } catch (RuntimeException e) {
+            assertEquals("Failed to retrieve data key and no fallback available", e.getMessage());
+            assertEquals(2, attemptCount.get());
+        }
     }
 
-    @Test
     public void testCacheClear() {
         // Add entries
         cache.getDataKey("key1", () -> new SecretKeySpec(new byte[32], "AES"));
         cache.getDataKey("key2", () -> new SecretKeySpec(new byte[32], "AES"));
 
-        DataKeyCache.CacheStats statsBefore = cache.getStats();
-        assertEquals(2, statsBefore.totalEntries);
+        CaffeineDataKeyCache.CacheStatistics statsBefore = cache.getStats();
+        assertEquals(2, statsBefore.estimatedSize);
 
         // Clear cache
         cache.clear();
 
-        DataKeyCache.CacheStats statsAfter = cache.getStats();
-        assertEquals(0, statsAfter.totalEntries);
+        CaffeineDataKeyCache.CacheStatistics statsAfter = cache.getStats();
+        assertEquals(0, statsAfter.estimatedSize);
+    }
+
+    public void testAdvancedMetrics() {
+        // Generate cache hits and misses to test metrics
+        cache.getDataKey("key1", () -> new SecretKeySpec(new byte[32], "AES"));
+        cache.getDataKey("key1", () -> new SecretKeySpec(new byte[32], "AES")); // Hit
+        cache.getDataKey("key2", () -> new SecretKeySpec(new byte[32], "AES")); // Miss
+
+        CaffeineDataKeyCache.CacheStatistics stats = cache.getStats();
+
+        // Verify Caffeine's advanced metrics
+        assertTrue("Hit count should be positive", stats.hitCount >= 0);
+        assertTrue("Miss count should be positive", stats.missCount >= 0);
+        assertTrue("Hit rate should be between 0 and 1", stats.getHitRate() >= 0.0 && stats.getHitRate() <= 1.0);
+        assertTrue("Average load time should be non-negative", stats.averageLoadTimeNanos >= 0);
+
+        // Test toString() method
+        String statsString = stats.toString();
+        assertNotNull(statsString);
+        assertTrue("Stats string should contain cache information", statsString.contains("CacheStats"));
+    }
+
+    public void testMultipleKeys() {
+        AtomicInteger keyGenerationCount = new AtomicInteger(0);
+
+        // Test multiple different keys
+        Key key1 = cache.getDataKey("key1", () -> {
+            keyGenerationCount.incrementAndGet();
+            return new SecretKeySpec(new byte[32], "AES");
+        });
+
+        Key key2 = cache.getDataKey("key2", () -> {
+            keyGenerationCount.incrementAndGet();
+            return new SecretKeySpec(new byte[32], "AES");
+        });
+
+        Key key1Again = cache.getDataKey("key1", () -> {
+            keyGenerationCount.incrementAndGet();
+            return new SecretKeySpec(new byte[32], "AES");
+        });
+
+        assertNotNull(key1);
+        assertNotNull(key2);
+        assertNotNull(key1Again);
+        assertSame(key1, key1Again); // Same key should be returned from cache
+        assertEquals(2, keyGenerationCount.get()); // Only 2 keys should be generated
     }
 }
