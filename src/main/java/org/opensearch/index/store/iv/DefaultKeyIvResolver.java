@@ -19,6 +19,7 @@ import org.apache.lucene.store.IndexOutput;
 import org.opensearch.common.Randomness;
 import org.opensearch.common.crypto.DataKeyPair;
 import org.opensearch.common.crypto.MasterKeyProvider;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.index.store.cipher.AesCipherFactory;
 
 /**
@@ -36,8 +37,8 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
 
     private final Directory directory;
     private final MasterKeyProvider keyProvider;
+    private final DataKeyCache dataKeyCache;
 
-    private Key dataKey;
     private String iv;
 
     private static final String IV_FILE = "ivFile";
@@ -49,22 +50,45 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
      * @param directory the Lucene directory to read/write metadata files
      * @param provider the JCE provider used for cipher operations
      * @param keyProvider the master key provider used to encrypt/decrypt data keys
+     * @param settings the settings containing cache configuration
      * @throws IOException if an I/O error occurs while reading or writing key/IV metadata
      */
-    public DefaultKeyIvResolver(Directory directory, Provider provider, MasterKeyProvider keyProvider) throws IOException {
+    public DefaultKeyIvResolver(Directory directory, Provider provider, MasterKeyProvider keyProvider, Settings settings)
+        throws IOException {
         this.directory = directory;
         this.keyProvider = keyProvider;
+
+        // Initialize cache with settings
+        int ttlSeconds = settings.getAsInt("kms.data_key_cache_ttl_seconds", 300);
+        int maxSize = settings.getAsInt("kms.data_key_cache_max_size", 100);
+        this.dataKeyCache = new DataKeyCache(ttlSeconds * 1000L, maxSize);
+
         initialize();
     }
 
     /**
-     * Attempts to load the IV and encrypted key from the directory.
+     * Constructs a new {@link DefaultKeyIvResolver} with default cache settings.
+     * This constructor is kept for backward compatibility.
+     *
+     * @param directory the Lucene directory to read/write metadata files
+     * @param provider the JCE provider used for cipher operations
+     * @param keyProvider the master key provider used to encrypt/decrypt data keys
+     * @throws IOException if an I/O error occurs while reading or writing key/IV metadata
+     */
+    public DefaultKeyIvResolver(Directory directory, Provider provider, MasterKeyProvider keyProvider) throws IOException {
+        this(directory, provider, keyProvider, Settings.EMPTY);
+    }
+
+    /**
+     * Attempts to load the IV from the directory.
      * If not present, it generates and persists new values.
+     * Data key is now loaded on-demand through the cache.
      */
     private void initialize() throws IOException {
         try {
             iv = readStringFile(IV_FILE);
-            dataKey = new SecretKeySpec(keyProvider.decryptKey(readByteArrayFile(KEY_FILE)), "AES");
+            // Pre-load the key into cache on initialization
+            getDataKey();
         } catch (java.nio.file.NoSuchFileException e) {
             initNewKeyAndIv();
         }
@@ -75,7 +99,6 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
      */
     private void initNewKeyAndIv() throws IOException {
         DataKeyPair pair = keyProvider.generateDataPair();
-        dataKey = new SecretKeySpec(pair.getRawKey(), "AES");
         writeByteArrayFile(KEY_FILE, pair.getEncryptedKey());
 
         byte[] ivBytes = new byte[AesCipherFactory.IV_ARRAY_LENGTH];
@@ -83,6 +106,9 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
         random.nextBytes(ivBytes);
         iv = Base64.getEncoder().encodeToString(ivBytes);
         writeStringFile(IV_FILE, iv);
+
+        // Pre-load the key into cache after creating new key and IV
+        getDataKey();
     }
 
     /**
@@ -127,10 +153,28 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
 
     /**
      * {@inheritDoc}
+     * Returns the data key, using TTL-based caching with automatic refresh from KMS.
      */
     @Override
     public Key getDataKey() {
-        return dataKey;
+        // Use cache with keyProvider's keyId as cache key, fallback to "default" if not available
+        String keyId;
+        try {
+            keyId = keyProvider.getKeyId();
+        } catch (Exception e) {
+            keyId = "default";
+        }
+
+        return dataKeyCache.getDataKey(keyId, () -> {
+            try {
+                // Read encrypted key from file and decrypt via KMS
+                byte[] encryptedKey = readByteArrayFile(KEY_FILE);
+                byte[] decryptedKey = keyProvider.decryptKey(encryptedKey);
+                return new SecretKeySpec(decryptedKey, "AES");
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to refresh data key from KMS", e);
+            }
+        });
     }
 
     /**
@@ -139,5 +183,35 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     @Override
     public byte[] getIvBytes() {
         return Base64.getDecoder().decode(iv);
+    }
+
+    /**
+     * Shuts down the data key cache and releases resources.
+     * Should be called when the resolver is no longer needed.
+     */
+    public void shutdown() {
+        if (dataKeyCache != null) {
+            dataKeyCache.shutdown();
+        }
+    }
+
+    /**
+     * Returns cache statistics for monitoring purposes.
+     *
+     * @return cache statistics
+     */
+    public DataKeyCache.CacheStats getCacheStats() {
+        return dataKeyCache != null ? dataKeyCache.getStats() : null;
+    }
+
+    /**
+     * Invalidates a specific key from the cache.
+     *
+     * @param keyId the key identifier to invalidate
+     */
+    public void invalidateKey(String keyId) {
+        if (dataKeyCache != null) {
+            dataKeyCache.invalidateKey(keyId);
+        }
     }
 }
