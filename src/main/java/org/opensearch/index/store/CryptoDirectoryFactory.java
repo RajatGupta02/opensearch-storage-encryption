@@ -73,16 +73,10 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
     }, Property.NodeScope, Property.IndexScope);
 
     /**
-     * Specifies the TTL for cached data keys in seconds. Default is 300 seconds (5 minutes).
+     * Specifies the TTL for data keys in seconds before they are refreshed from KMS. Default is 300 seconds (5 minutes).
      */
-    public static final Setting<Integer> KMS_DATA_KEY_CACHE_TTL_SECONDS_SETTING = Setting
-        .intSetting("index.store.kms.data_key_cache_ttl_seconds", 300, 1, Property.NodeScope, Property.IndexScope);
-
-    /**
-     * Specifies the maximum number of data keys to cache. Default is 100, set to 0 for unlimited.
-     */
-    public static final Setting<Integer> KMS_DATA_KEY_CACHE_MAX_SIZE_SETTING = Setting
-        .intSetting("index.store.kms.data_key_cache_max_size", 100, 0, Property.NodeScope, Property.IndexScope);
+    public static final Setting<Integer> KMS_DATA_KEY_TTL_SECONDS_SETTING = Setting
+        .intSetting("index.store.kms.data_key_ttl_seconds", 300, 1, Property.NodeScope, Property.IndexScope);
 
     MasterKeyProvider getKeyProvider(IndexSettings indexSettings) {
         final String KEY_PROVIDER_TYPE = indexSettings.getValue(INDEX_KMS_TYPE_SETTING);
@@ -125,14 +119,13 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
         final Provider provider = indexSettings.getValue(INDEX_CRYPTO_PROVIDER_SETTING);
         Directory baseDir = new NIOFSDirectory(location, lockFactory);
 
-        // Build settings for cache configuration
-        Settings cacheSettings = Settings
+        // Build settings for TTL configuration
+        Settings ttlSettings = Settings
             .builder()
-            .put("index.store.kms.data_key_cache_ttl_seconds", indexSettings.getValue(KMS_DATA_KEY_CACHE_TTL_SECONDS_SETTING))
-            .put("index.store.kms.data_key_cache_max_size", indexSettings.getValue(KMS_DATA_KEY_CACHE_MAX_SIZE_SETTING))
+            .put("index.store.kms.data_key_ttl_seconds", indexSettings.getValue(KMS_DATA_KEY_TTL_SECONDS_SETTING))
             .build();
 
-        KeyIvResolver keyIvResolver = new DefaultKeyIvResolver(baseDir, provider, getKeyProvider(indexSettings), cacheSettings);
+        KeyIvResolver keyIvResolver = new DefaultKeyIvResolver(baseDir, provider, getKeyProvider(indexSettings), ttlSettings);
 
         IndexModule.Type type = IndexModule.defaultStoreType(IndexModule.NODE_STORE_ALLOW_MMAP.get(indexSettings.getNodeSettings()));
         Set<String> preLoadExtensions = new HashSet<>(indexSettings.getValue(IndexModule.INDEX_STORE_PRE_LOAD_SETTING));

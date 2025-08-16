@@ -39,8 +39,7 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
             .asList(
                 CryptoDirectoryFactory.INDEX_KMS_TYPE_SETTING,
                 CryptoDirectoryFactory.INDEX_CRYPTO_PROVIDER_SETTING,
-                CryptoDirectoryFactory.KMS_DATA_KEY_CACHE_TTL_SECONDS_SETTING,
-                CryptoDirectoryFactory.KMS_DATA_KEY_CACHE_MAX_SIZE_SETTING
+                CryptoDirectoryFactory.KMS_DATA_KEY_TTL_SECONDS_SETTING
             );
     }
 

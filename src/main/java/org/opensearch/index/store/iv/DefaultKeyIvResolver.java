@@ -9,9 +9,13 @@ import java.security.Key;
 import java.security.Provider;
 import java.security.SecureRandom;
 import java.util.Base64;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import javax.crypto.spec.SecretKeySpec;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
@@ -35,9 +39,18 @@ import org.opensearch.index.store.cipher.AesCipherFactory;
  */
 public class DefaultKeyIvResolver implements KeyIvResolver {
 
+    private static final Logger logger = LogManager.getLogger(DefaultKeyIvResolver.class);
+
     private final Directory directory;
     private final MasterKeyProvider keyProvider;
-    private final CaffeineDataKeyCache dataKeyCache;
+    private final long ttlMillis;
+
+    // Thread-safe TTL-based data key management
+    private final AtomicReference<DataKeyHolder> dataKeyRef = new AtomicReference<>();
+    private final AtomicBoolean refreshInProgress = new AtomicBoolean(false);
+
+    // Pre-emptive refresh at 80% of TTL to avoid blocking
+    private static final double REFRESH_THRESHOLD = 0.8;
 
     private String iv;
 
@@ -50,7 +63,7 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
      * @param directory the Lucene directory to read/write metadata files
      * @param provider the JCE provider used for cipher operations
      * @param keyProvider the master key provider used to encrypt/decrypt data keys
-     * @param settings the settings containing cache configuration
+     * @param settings the settings containing TTL configuration
      * @throws IOException if an I/O error occurs while reading or writing key/IV metadata
      */
     public DefaultKeyIvResolver(Directory directory, Provider provider, MasterKeyProvider keyProvider, Settings settings)
@@ -58,16 +71,15 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
         this.directory = directory;
         this.keyProvider = keyProvider;
 
-        // Initialize cache with settings
-        int ttlSeconds = settings.getAsInt("index.store.kms.data_key_cache_ttl_seconds", 300);
-        int maxSize = settings.getAsInt("index.store.kms.data_key_cache_max_size", 100);
-        this.dataKeyCache = new CaffeineDataKeyCache(ttlSeconds * 1000L, maxSize);
+        // Read TTL from settings (default 5 minutes)
+        int ttlSeconds = settings.getAsInt("index.store.kms.data_key_ttl_seconds", 300);
+        this.ttlMillis = ttlSeconds * 1000L;
 
         initialize();
     }
 
     /**
-     * Constructs a new {@link DefaultKeyIvResolver} with default cache settings.
+     * Constructs a new {@link DefaultKeyIvResolver} with default TTL settings.
      * This constructor is kept for backward compatibility.
      *
      * @param directory the Lucene directory to read/write metadata files
@@ -82,13 +94,16 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     /**
      * Attempts to load the IV from the directory.
      * If not present, it generates and persists new values.
-     * Data key is now loaded on-demand through the cache.
+     * Data key is loaded synchronously during initialization.
      */
     private void initialize() throws IOException {
         try {
             iv = readStringFile(IV_FILE);
-            // Pre-load the key into cache on initialization
-            getDataKey();
+
+            Key dataKey = new SecretKeySpec(keyProvider.decryptKey(readByteArrayFile(KEY_FILE)), "AES");
+
+            DataKeyHolder holder = new DataKeyHolder(dataKey, System.currentTimeMillis());
+            dataKeyRef.set(holder);
         } catch (java.nio.file.NoSuchFileException e) {
             initNewKeyAndIv();
         }
@@ -107,8 +122,11 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
         iv = Base64.getEncoder().encodeToString(ivBytes);
         writeStringFile(IV_FILE, iv);
 
-        // Pre-load the key into cache after creating new key and IV
-        getDataKey();
+        byte[] decryptedKey = keyProvider.decryptKey(pair.getEncryptedKey());
+        Key dataKey = new SecretKeySpec(decryptedKey, "AES");
+
+        DataKeyHolder holder = new DataKeyHolder(dataKey, System.currentTimeMillis());
+        dataKeyRef.set(holder);
     }
 
     /**
@@ -153,28 +171,70 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
 
     /**
      * {@inheritDoc}
-     * Returns the data key, using TTL-based caching with automatic refresh from KMS.
+     * Returns the data key, using TTL-based refresh with pre-emptive KMS calls.
+     * Index operations are never blocked by KMS calls.
      */
     @Override
     public Key getDataKey() {
-        // Use cache with keyProvider's keyId as cache key, fallback to "default" if not available
-        String keyId;
-        try {
-            keyId = keyProvider.getKeyId();
-        } catch (Exception e) {
-            keyId = "default";
+        DataKeyHolder current = dataKeyRef.get();
+
+        // Handle first-time initialization (should not happen after initialize())
+        if (current == null) {
+            synchronized (this) {
+                // Double-check after acquiring lock
+                current = dataKeyRef.get();
+                if (current != null) {
+                    return current.getDataKey();
+                }
+
+                try {
+                    byte[] encryptedKey = readByteArrayFile(KEY_FILE);
+                    byte[] decryptedKey = keyProvider.decryptKey(encryptedKey);
+                    Key newKey = new SecretKeySpec(decryptedKey, "AES");
+
+                    DataKeyHolder holder = new DataKeyHolder(newKey, System.currentTimeMillis());
+                    dataKeyRef.set(holder);
+                    logger.info("Successfully initialized data key from KMS");
+                    return newKey;
+                } catch (Exception e) {
+                    logger.error("Failed to initialize data key from KMS", e);
+                    throw new RuntimeException("Failed to initialize data key from KMS", e);
+                }
+            }
         }
 
-        return dataKeyCache.getDataKey(keyId, () -> {
-            try {
-                // Read encrypted key from file and decrypt via KMS
-                byte[] encryptedKey = readByteArrayFile(KEY_FILE);
-                byte[] decryptedKey = keyProvider.decryptKey(encryptedKey);
-                return new SecretKeySpec(decryptedKey, "AES");
-            } catch (IOException e) {
-                throw new RuntimeException("Failed to refresh data key from KMS", e);
+        // Check if pre-emptive refresh needed (at 80% of TTL)
+        if (current.needsRefresh(ttlMillis, REFRESH_THRESHOLD)) {
+            // Non-blocking: try to start refresh
+            if (refreshInProgress.compareAndSet(false, true)) {
+                try {
+                    byte[] encryptedKey = readByteArrayFile(KEY_FILE);
+                    byte[] decryptedKey = keyProvider.decryptKey(encryptedKey);
+                    Key newKey = new SecretKeySpec(decryptedKey, "AES");
+
+                    // Atomic update - only after successful KMS call
+                    DataKeyHolder newHolder = new DataKeyHolder(newKey, System.currentTimeMillis());
+                    dataKeyRef.set(newHolder);
+
+                    logger.debug("Successfully refreshed data key from KMS pre-emptively");
+
+                } catch (Exception e) {
+                    // Log error but don't fail - current key continues to work
+                    logger.warn("Pre-emptive data key refresh failed, will retry later", e);
+
+                    // Check if current key is truly expired (safety net)
+                    if (current.isExpired(ttlMillis)) {
+                        // This is critical - expired key and refresh failed
+                        logger.error("Data key is expired and refresh failed", e);
+                        throw new RuntimeException("Data key expired and KMS refresh failed", e);
+                    }
+                } finally {
+                    refreshInProgress.set(false);
+                }
             }
-        });
+        }
+
+        return current.getDataKey();
     }
 
     /**
@@ -185,33 +245,4 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
         return Base64.getDecoder().decode(iv);
     }
 
-    /**
-     * Shuts down the data key cache and releases resources.
-     * Should be called when the resolver is no longer needed.
-     */
-    public void shutdown() {
-        if (dataKeyCache != null) {
-            dataKeyCache.shutdown();
-        }
-    }
-
-    /**
-     * Returns cache statistics for monitoring purposes.
-     *
-     * @return cache statistics
-     */
-    public CaffeineDataKeyCache.CacheStatistics getCacheStats() {
-        return dataKeyCache != null ? dataKeyCache.getStats() : null;
-    }
-
-    /**
-     * Invalidates a specific key from the cache.
-     *
-     * @param keyId the key identifier to invalidate
-     */
-    public void invalidateKey(String keyId) {
-        if (dataKeyCache != null) {
-            dataKeyCache.invalidateKey(keyId);
-        }
-    }
 }
