@@ -26,7 +26,9 @@ import org.opensearch.common.crypto.MasterKeyProvider;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.index.store.cipher.AesCipherFactory;
 
-import com.amazonaws.AmazonServiceException;
+import software.amazon.awssdk.awscore.exception.AwsServiceException;
+import software.amazon.awssdk.services.kms.model.DisabledException;
+import software.amazon.awssdk.services.kms.model.KmsException;
 
 /**
  * Default implementation of {@link KeyIvResolver} responsible for managing
@@ -205,7 +207,28 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
             return initializeDataKeyWithRetry();
         }
 
-        // SECURITY RULE: Never return expired keys
+        if (current.isExpired(ttlMillis) && circuitState == CircuitState.CLOSED) {
+            synchronized (this) {
+                // Double-check after acquiring lock
+                current = dataKeyRef.get();
+                if (current != null && current.isExpired(ttlMillis)) {
+                    logger.warn("Data key expired with circuit CLOSED - attempting emergency refresh");
+                    try {
+                        Key newKey = performKmsRefresh();
+                        DataKeyHolder newHolder = new DataKeyHolder(newKey, System.currentTimeMillis());
+                        dataKeyRef.set(newHolder);
+                        resetCircuitBreaker();
+                        logger.info("Emergency refresh successful - key recovered");
+                        return newKey;
+                    } catch (Exception e) {
+                        handleKmsFailure(e);
+                        logger.error("Emergency refresh failed", e);
+                        // Fall through to throw exception below
+                    }
+                }
+            }
+        }
+
         if (current.isExpired(ttlMillis)) {
             long expiredSeconds = (System.currentTimeMillis() - (current.getRefreshTime() + ttlMillis)) / 1000;
             String errorMsg = String
@@ -369,57 +392,71 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     }
 
     /**
-     * Classify failure as permanent or transient using AWS error codes.
+     * Classify failure as permanent or transient using AWS SDK v2 error codes.
      */
     private boolean isPermanentFailure(Exception e) {
-        // AWS KMS specific error classification using structured error codes
-        if (e instanceof AmazonServiceException) {
-            AmazonServiceException awsEx = (AmazonServiceException) e;
-            String errorCode = awsEx.getErrorCode();
+        // Handle specific AWS KMS exception types first
+        if (e instanceof DisabledException) {
+            logger.warn("Permanent KMS failure - Key is disabled: {}", e.getMessage());
+            return true;
+        }
+
+        // AWS KMS specific error classification using AWS SDK v2
+        if (e instanceof AwsServiceException) {
+            AwsServiceException awsEx = (AwsServiceException) e;
+            String errorCode = awsEx.awsErrorDetails() != null ? awsEx.awsErrorDetails().errorCode() : "Unknown";
+            int statusCode = awsEx.statusCode();
 
             // Permanent failures - use 5-minute recovery interval
             switch (errorCode) {
-                case "AccessDenied":              // 403 - No permission to use key
-                case "InvalidKeyId.NotFound":     // 400 - Key doesn't exist
-                case "KMSInvalidStateException":  // 400 - Key disabled/deleted
-                case "DisabledException":         // 400 - Key explicitly disabled
-                case "KeyUnavailableException":   // 500 - Key permanently unavailable
-                    logger
-                        .warn(
-                            "Permanent KMS failure - Code: {}, Status: {}, RequestId: {}",
-                            errorCode,
-                            awsEx.getStatusCode(),
-                            awsEx.getRequestId()
-                        );
+                case "AccessDeniedException":        // 403 - No permission to use key
+                case "InvalidKeyId.NotFound":        // 400 - Key doesn't exist
+                case "KMSInvalidStateException":     // 400 - Key disabled/deleted
+                case "DisabledException":            // 400 - Key explicitly disabled
+                case "KeyUnavailableException":      // 500 - Key permanently unavailable
+                case "NotFoundException":            // 400 - Key not found
+                    logger.warn("Permanent KMS failure - Code: {}, Status: {}, RequestId: {}", errorCode, statusCode, awsEx.requestId());
                     return true;
 
-                case "ThrottlingException":         // 400 - Rate limiting
-                case "KMSInternalException":        // 500 - Internal AWS error
-                case "DependencyTimeoutException":  // Network timeout
-                case "ServiceUnavailableException": // 503 - Temporary unavailable
-                    logger
-                        .warn(
-                            "Transient KMS failure - Code: {}, Status: {}, RequestId: {}",
-                            errorCode,
-                            awsEx.getStatusCode(),
-                            awsEx.getRequestId()
-                        );
+                case "ThrottlingException":          // 400 - Rate limiting
+                case "KMSInternalException":         // 500 - Internal AWS error
+                case "DependencyTimeoutException":   // Network timeout
+                case "ServiceUnavailableException":  // 503 - Temporary unavailable
+                    logger.warn("Transient KMS failure - Code: {}, Status: {}, RequestId: {}", errorCode, statusCode, awsEx.requestId());
                     return false;
 
                 default:
                     // Unknown AWS error - classify by HTTP status code
-                    int statusCode = awsEx.getStatusCode();
                     boolean isPermanent = statusCode >= 400 && statusCode < 500;
                     logger
                         .warn(
                             "Unknown AWS KMS error - Code: {}, Status: {}, RequestId: {}, Classified as: {}",
                             errorCode,
                             statusCode,
-                            awsEx.getRequestId(),
+                            awsEx.requestId(),
                             isPermanent ? "permanent" : "transient"
                         );
                     return isPermanent;
             }
+        }
+
+        // Handle general KMS exceptions
+        if (e instanceof KmsException) {
+            KmsException kmsEx = (KmsException) e;
+            String errorCode = kmsEx.awsErrorDetails() != null ? kmsEx.awsErrorDetails().errorCode() : "Unknown";
+            int statusCode = kmsEx.statusCode();
+
+            // Apply same classification logic
+            boolean isPermanent = statusCode >= 400 && statusCode < 500;
+            logger
+                .warn(
+                    "KMS exception - Code: {}, Status: {}, RequestId: {}, Classified as: {}",
+                    errorCode,
+                    statusCode,
+                    kmsEx.requestId(),
+                    isPermanent ? "permanent" : "transient"
+                );
+            return isPermanent;
         }
 
         // Non-AWS exceptions: default to transient (conservative approach)
