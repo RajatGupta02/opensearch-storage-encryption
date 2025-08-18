@@ -78,6 +78,31 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
     public static final Setting<Integer> KMS_DATA_KEY_TTL_SECONDS_SETTING = Setting
         .intSetting("index.store.kms.data_key_ttl_seconds", 300, 1, Property.NodeScope, Property.IndexScope);
 
+    /**
+     * Specifies the number of consecutive KMS failures before opening the circuit breaker. Default is 3.
+     */
+    public static final Setting<Integer> KMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD_SETTING = Setting
+        .intSetting("index.store.kms.circuit_breaker_failure_threshold", 3, 1, 20, Property.NodeScope, Property.IndexScope);
+
+    /**
+     * Specifies the recovery interval in milliseconds for permanent failures (e.g., disabled KMS key). Default is 300000ms (5 minutes).
+     */
+    public static final Setting<Integer> KMS_PERMANENT_FAILURE_RECOVERY_INTERVAL_MS_SETTING = Setting
+        .intSetting(
+            "index.store.kms.permanent_failure_recovery_interval_ms",
+            300000,
+            30000,
+            1800000,
+            Property.NodeScope,
+            Property.IndexScope
+        );
+
+    /**
+     * Specifies the recovery interval in milliseconds for transient failures (e.g., network timeouts). Default is 30000ms (30 seconds).
+     */
+    public static final Setting<Integer> KMS_TRANSIENT_FAILURE_RECOVERY_INTERVAL_MS_SETTING = Setting
+        .intSetting("index.store.kms.transient_failure_recovery_interval_ms", 30000, 5000, 300000, Property.NodeScope, Property.IndexScope);
+
     MasterKeyProvider getKeyProvider(IndexSettings indexSettings) {
         final String KEY_PROVIDER_TYPE = indexSettings.getValue(INDEX_KMS_TYPE_SETTING);
         final Settings settings = Settings.builder().put(indexSettings.getNodeSettings(), false).build();
@@ -119,10 +144,19 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
         final Provider provider = indexSettings.getValue(INDEX_CRYPTO_PROVIDER_SETTING);
         Directory baseDir = new NIOFSDirectory(location, lockFactory);
 
-        // Build settings for TTL configuration
+        // Build settings for TTL and circuit breaker configuration
         Settings ttlSettings = Settings
             .builder()
             .put("index.store.kms.data_key_ttl_seconds", indexSettings.getValue(KMS_DATA_KEY_TTL_SECONDS_SETTING))
+            .put("index.store.kms.circuit_breaker_failure_threshold", indexSettings.getValue(KMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD_SETTING))
+            .put(
+                "index.store.kms.permanent_failure_recovery_interval_ms",
+                indexSettings.getValue(KMS_PERMANENT_FAILURE_RECOVERY_INTERVAL_MS_SETTING)
+            )
+            .put(
+                "index.store.kms.transient_failure_recovery_interval_ms",
+                indexSettings.getValue(KMS_TRANSIENT_FAILURE_RECOVERY_INTERVAL_MS_SETTING)
+            )
             .build();
 
         KeyIvResolver keyIvResolver = new DefaultKeyIvResolver(baseDir, provider, getKeyProvider(indexSettings), ttlSettings);

@@ -72,12 +72,24 @@ public class CryptoEngineFactory implements EngineFactory {
         // Create crypto directory factory to get the key provider
         CryptoDirectoryFactory directoryFactory = new CryptoDirectoryFactory();
 
-        // Build settings for TTL configuration (same as CryptoDirectoryFactory)
+        // Build settings for TTL and circuit breaker configuration (same as CryptoDirectoryFactory)
         Settings ttlSettings = Settings
             .builder()
             .put(
                 "index.store.kms.data_key_ttl_seconds",
                 config.getIndexSettings().getValue(CryptoDirectoryFactory.KMS_DATA_KEY_TTL_SECONDS_SETTING)
+            )
+            .put(
+                "index.store.kms.circuit_breaker_failure_threshold",
+                config.getIndexSettings().getValue(CryptoDirectoryFactory.KMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD_SETTING)
+            )
+            .put(
+                "index.store.kms.permanent_failure_recovery_interval_ms",
+                config.getIndexSettings().getValue(CryptoDirectoryFactory.KMS_PERMANENT_FAILURE_RECOVERY_INTERVAL_MS_SETTING)
+            )
+            .put(
+                "index.store.kms.transient_failure_recovery_interval_ms",
+                config.getIndexSettings().getValue(CryptoDirectoryFactory.KMS_TRANSIENT_FAILURE_RECOVERY_INTERVAL_MS_SETTING)
             )
             .build();
 
