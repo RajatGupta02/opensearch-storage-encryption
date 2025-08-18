@@ -11,6 +11,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineFactory;
@@ -71,11 +72,21 @@ public class CryptoEngineFactory implements EngineFactory {
         // Create crypto directory factory to get the key provider
         CryptoDirectoryFactory directoryFactory = new CryptoDirectoryFactory();
 
-        // Create a dedicated key resolver for translog
+        // Build settings for TTL configuration (same as CryptoDirectoryFactory)
+        Settings ttlSettings = Settings
+            .builder()
+            .put(
+                "index.store.kms.data_key_ttl_seconds",
+                config.getIndexSettings().getValue(CryptoDirectoryFactory.KMS_DATA_KEY_TTL_SECONDS_SETTING)
+            )
+            .build();
+
+        // Create a dedicated key resolver for translog with consistent TTL settings
         return new DefaultKeyIvResolver(
             keyDirectory,
             config.getIndexSettings().getValue(CryptoDirectoryFactory.INDEX_CRYPTO_PROVIDER_SETTING),
-            directoryFactory.getKeyProvider(config.getIndexSettings())
+            directoryFactory.getKeyProvider(config.getIndexSettings()),
+            ttlSettings
         );
     }
 
