@@ -9,6 +9,9 @@ import java.security.Key;
 import java.security.Provider;
 import java.security.SecureRandom;
 import java.util.Base64;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -67,6 +70,10 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     private final int circuitBreakerFailureThreshold;
     private final long permanentFailureRecoveryIntervalMs;
     private final long transientFailureRecoveryIntervalMs;
+
+    // Background recovery thread for proactive KMS recovery
+    private volatile ScheduledExecutorService backgroundRecoveryExecutor;
+    private final AtomicBoolean backgroundRecoveryStarted = new AtomicBoolean(false);
 
     private String iv;
 
@@ -375,6 +382,9 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
             if (circuitState != newState) {
                 logger.warn("Circuit breaker opened: {} (consecutive failures: {})", newState, consecutiveFailures);
                 circuitState = newState;
+
+                // Start background recovery thread when circuit opens
+                startBackgroundRecovery();
             }
         }
     }
@@ -385,6 +395,9 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     private void resetCircuitBreaker() {
         consecutiveFailures = 0;
         circuitState = CircuitState.CLOSED;
+
+        // Stop background recovery thread when circuit closes
+        stopBackgroundRecovery();
     }
 
     /**
@@ -440,6 +453,95 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
         // This ensures we don't get stuck in long recovery intervals for unknown issues
         logger.warn("Unknown KMS failure, treating as transient: {}", message);
         return false;
+    }
+
+    /**
+     * Start background recovery thread for proactive KMS recovery when circuit is open.
+     */
+    private void startBackgroundRecovery() {
+        // Use compareAndSet to ensure only one thread starts the background recovery
+        if (backgroundRecoveryStarted.compareAndSet(false, true)) {
+            try {
+                // Create single-threaded executor for recovery
+                backgroundRecoveryExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread thread = new Thread(r, "kms-recovery-" + System.identityHashCode(this));
+                    thread.setDaemon(true); // Don't prevent JVM shutdown
+                    return thread;
+                });
+
+                // Calculate initial delay based on circuit state
+                long initialDelay = (circuitState == CircuitState.OPEN_PERMANENT)
+                    ? permanentFailureRecoveryIntervalMs
+                    : transientFailureRecoveryIntervalMs;
+
+                // Schedule recurring recovery attempts
+                backgroundRecoveryExecutor
+                    .scheduleWithFixedDelay(
+                        this::backgroundRecoveryTask,
+                        initialDelay / 2,  // Start sooner for first attempt
+                        Math.min(permanentFailureRecoveryIntervalMs, transientFailureRecoveryIntervalMs) / 2, // Check every 15s/2.5min
+                        TimeUnit.MILLISECONDS
+                    );
+
+                logger.info("Background KMS recovery thread started for circuit state: {}", circuitState);
+            } catch (Exception e) {
+                logger.error("Failed to start background recovery thread", e);
+                backgroundRecoveryStarted.set(false); // Reset on failure
+            }
+        }
+    }
+
+    /**
+     * Stop background recovery thread when circuit closes.
+     */
+    private void stopBackgroundRecovery() {
+        if (backgroundRecoveryStarted.compareAndSet(true, false)) {
+            if (backgroundRecoveryExecutor != null) {
+                backgroundRecoveryExecutor.shutdown();
+                try {
+                    if (!backgroundRecoveryExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                        backgroundRecoveryExecutor.shutdownNow();
+                    }
+                    logger.info("Background KMS recovery thread stopped");
+                } catch (InterruptedException e) {
+                    backgroundRecoveryExecutor.shutdownNow();
+                    Thread.currentThread().interrupt();
+                }
+                backgroundRecoveryExecutor = null;
+            }
+        }
+    }
+
+    /**
+     * Background recovery task that runs periodically when circuit is open.
+     */
+    private void backgroundRecoveryTask() {
+        try {
+            // Only run when circuit is open
+            if (circuitState == CircuitState.CLOSED) {
+                stopBackgroundRecovery();
+                return;
+            }
+
+            // Check if it's time to attempt recovery
+            if (!shouldAttemptRecovery()) {
+                return;
+            }
+
+            logger.debug("Background recovery task attempting KMS recovery. State: {}", circuitState);
+
+            // Attempt recovery using existing logic
+            attemptSingleRecovery();
+
+            // If recovery was successful, circuit will be CLOSED and this thread will stop
+            if (circuitState == CircuitState.CLOSED) {
+                logger.info("Background recovery successful - stopping recovery thread");
+                stopBackgroundRecovery();
+            }
+
+        } catch (Exception e) {
+            logger.warn("Background recovery task failed: {}", e.getMessage());
+        }
     }
 
     /**
