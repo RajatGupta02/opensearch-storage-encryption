@@ -62,10 +62,7 @@ dependencies {
     testImplementation "org.opensearch.test:framework:${opensearch_version}"
     testImplementation "commons-io:commons-io:2.13.0"
 
-    // AWS SDK v2 for KMS error classification
-    implementation 'software.amazon.awssdk:sdk-core:2.20.26'
-    implementation 'software.amazon.awssdk:aws-core:2.20.26'
-    implementation 'software.amazon.awssdk:kms:2.20.26'
+    // Simple error classification - no external dependencies needed
 
     // Integration test dependencies
     testImplementation "org.opensearch.plugin:reindex-client:${opensearch_version}"

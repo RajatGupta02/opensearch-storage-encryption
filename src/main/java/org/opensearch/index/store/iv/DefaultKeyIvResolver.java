@@ -26,10 +26,6 @@ import org.opensearch.common.crypto.MasterKeyProvider;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.index.store.cipher.AesCipherFactory;
 
-import software.amazon.awssdk.awscore.exception.AwsServiceException;
-import software.amazon.awssdk.services.kms.model.DisabledException;
-import software.amazon.awssdk.services.kms.model.KmsException;
-
 /**
  * Default implementation of {@link KeyIvResolver} responsible for managing
  * the encryption key and initialization vector (IV) used in encrypting and decrypting
@@ -392,75 +388,57 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     }
 
     /**
-     * Classify failure as permanent or transient using AWS SDK v2 error codes.
+     * Classify failure as permanent or transient using simple error message analysis.
      */
     private boolean isPermanentFailure(Exception e) {
-        // Handle specific AWS KMS exception types first
-        if (e instanceof DisabledException) {
-            logger.warn("Permanent KMS failure - Key is disabled: {}", e.getMessage());
+        String message = e.getMessage();
+        if (message == null) {
+            // No message - default to transient (conservative)
+            logger.warn("KMS exception with no message: {}", e.getClass().getSimpleName());
+            return false;
+        }
+
+        String lowerMessage = message.toLowerCase();
+
+        // Permanent failures - use 5-minute recovery interval
+        // These indicate configuration or authorization issues that won't resolve quickly
+        if (lowerMessage.contains("is disabled") ||                    // DisabledException
+            lowerMessage.contains("disabled") ||                       // Key disabled
+            lowerMessage.contains("access denied") ||                  // AccessDeniedException
+            lowerMessage.contains("accessdenied") ||                   // AccessDenied variant
+            lowerMessage.contains("unauthorized") ||                   // 401/403 errors
+            lowerMessage.contains("forbidden") ||                      // 403 errors
+            lowerMessage.contains("not found") ||                      // NotFoundException
+            lowerMessage.contains("notfound") ||                       // NotFound variant
+            lowerMessage.contains("invalid key") ||                    // InvalidKeyId
+            lowerMessage.contains("key not found") ||                  // Key doesn't exist
+            lowerMessage.contains("does not exist") ||                 // Resource doesn't exist
+            lowerMessage.contains("invalid parameter") ||              // Bad configuration
+            lowerMessage.contains("malformed") ||                      // Malformed request
+            lowerMessage.contains("bad request")) {                    // 400 errors
+
+            logger.warn("Permanent KMS failure detected: {}", message);
             return true;
         }
 
-        // AWS KMS specific error classification using AWS SDK v2
-        if (e instanceof AwsServiceException) {
-            AwsServiceException awsEx = (AwsServiceException) e;
-            String errorCode = awsEx.awsErrorDetails() != null ? awsEx.awsErrorDetails().errorCode() : "Unknown";
-            int statusCode = awsEx.statusCode();
+        // Transient failures - use 30-second recovery interval
+        // These indicate temporary issues that may resolve quickly
+        if (lowerMessage.contains("throttling") ||                     // ThrottlingException
+            lowerMessage.contains("rate limit") ||                     // Rate limiting
+            lowerMessage.contains("too many requests") ||              // Rate limiting
+            lowerMessage.contains("service unavailable") ||            // 503 errors
+            lowerMessage.contains("internal error") ||                 // 500 errors
+            lowerMessage.contains("timeout") ||                        // Network timeouts
+            lowerMessage.contains("connection") ||                     // Connection issues
+            lowerMessage.contains("network")) {                        // Network issues
 
-            // Permanent failures - use 5-minute recovery interval
-            switch (errorCode) {
-                case "AccessDeniedException":        // 403 - No permission to use key
-                case "InvalidKeyId.NotFound":        // 400 - Key doesn't exist
-                case "KMSInvalidStateException":     // 400 - Key disabled/deleted
-                case "DisabledException":            // 400 - Key explicitly disabled
-                case "KeyUnavailableException":      // 500 - Key permanently unavailable
-                case "NotFoundException":            // 400 - Key not found
-                    logger.warn("Permanent KMS failure - Code: {}, Status: {}, RequestId: {}", errorCode, statusCode, awsEx.requestId());
-                    return true;
-
-                case "ThrottlingException":          // 400 - Rate limiting
-                case "KMSInternalException":         // 500 - Internal AWS error
-                case "DependencyTimeoutException":   // Network timeout
-                case "ServiceUnavailableException":  // 503 - Temporary unavailable
-                    logger.warn("Transient KMS failure - Code: {}, Status: {}, RequestId: {}", errorCode, statusCode, awsEx.requestId());
-                    return false;
-
-                default:
-                    // Unknown AWS error - classify by HTTP status code
-                    boolean isPermanent = statusCode >= 400 && statusCode < 500;
-                    logger
-                        .warn(
-                            "Unknown AWS KMS error - Code: {}, Status: {}, RequestId: {}, Classified as: {}",
-                            errorCode,
-                            statusCode,
-                            awsEx.requestId(),
-                            isPermanent ? "permanent" : "transient"
-                        );
-                    return isPermanent;
-            }
+            logger.warn("Transient KMS failure detected: {}", message);
+            return false;
         }
 
-        // Handle general KMS exceptions
-        if (e instanceof KmsException) {
-            KmsException kmsEx = (KmsException) e;
-            String errorCode = kmsEx.awsErrorDetails() != null ? kmsEx.awsErrorDetails().errorCode() : "Unknown";
-            int statusCode = kmsEx.statusCode();
-
-            // Apply same classification logic
-            boolean isPermanent = statusCode >= 400 && statusCode < 500;
-            logger
-                .warn(
-                    "KMS exception - Code: {}, Status: {}, RequestId: {}, Classified as: {}",
-                    errorCode,
-                    statusCode,
-                    kmsEx.requestId(),
-                    isPermanent ? "permanent" : "transient"
-                );
-            return isPermanent;
-        }
-
-        // Non-AWS exceptions: default to transient (conservative approach)
-        logger.warn("Non-AWS KMS exception: {}", e.getClass().getSimpleName());
+        // Default classification: treat unknown errors as transient (conservative approach)
+        // This ensures we don't get stuck in long recovery intervals for unknown issues
+        logger.warn("Unknown KMS failure, treating as transient: {}", message);
         return false;
     }
 
