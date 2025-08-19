@@ -30,7 +30,6 @@ import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.index.store.hybrid.HybridCryptoDirectory;
-import org.opensearch.index.store.iv.DefaultKeyIvResolver;
 import org.opensearch.index.store.iv.KeyIvResolver;
 import org.opensearch.index.store.mmap.EagerDecryptedCryptoMMapDirectory;
 import org.opensearch.index.store.mmap.LazyDecryptedCryptoMMapDirectory;
@@ -45,11 +44,14 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
 
     private static final Logger LOGGER = LogManager.getLogger(CryptoDirectoryFactory.class);
 
+    private final NodeKeyService nodeKeyService;
+
     /**
-     * Creates a new CryptoDirectoryFactory
+     * Creates a new CryptoDirectoryFactory with node-level key service
      */
-    public CryptoDirectoryFactory() {
+    public CryptoDirectoryFactory(NodeKeyService nodeKeyService) {
         super();
+        this.nodeKeyService = nodeKeyService;
     }
 
     /**
@@ -119,13 +121,8 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
         final Provider provider = indexSettings.getValue(INDEX_CRYPTO_PROVIDER_SETTING);
         Directory baseDir = new NIOFSDirectory(location, lockFactory);
 
-        // Build settings for TTL configuration
-        Settings ttlSettings = Settings
-            .builder()
-            .put("index.store.kms.data_key_ttl_seconds", indexSettings.getValue(KMS_DATA_KEY_TTL_SECONDS_SETTING))
-            .build();
-
-        KeyIvResolver keyIvResolver = new DefaultKeyIvResolver(baseDir, provider, getKeyProvider(indexSettings), ttlSettings);
+        // Use node-level key resolver based on index settings
+        KeyIvResolver keyIvResolver = nodeKeyService.getResolver(indexSettings);
 
         IndexModule.Type type = IndexModule.defaultStoreType(IndexModule.NODE_STORE_ALLOW_MMAP.get(indexSettings.getNodeSettings()));
         Set<String> preLoadExtensions = new HashSet<>(indexSettings.getValue(IndexModule.INDEX_STORE_PRE_LOAD_SETTING));

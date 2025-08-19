@@ -5,18 +5,13 @@
 package org.opensearch.index.store;
 
 import java.io.IOException;
-import java.nio.file.Path;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.FSDirectory;
-import org.opensearch.common.settings.Settings;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.engine.InternalEngine;
-import org.opensearch.index.store.iv.DefaultKeyIvResolver;
 import org.opensearch.index.store.iv.KeyIvResolver;
 import org.opensearch.index.translog.CryptoTranslogFactory;
 
@@ -27,10 +22,14 @@ public class CryptoEngineFactory implements EngineFactory {
 
     private static final Logger logger = LogManager.getLogger(CryptoEngineFactory.class);
 
+    private final NodeKeyService nodeKeyService;
+
     /**
-     * Default constructor.
+     * Constructor with node-level key service.
      */
-    public CryptoEngineFactory() {}
+    public CryptoEngineFactory(NodeKeyService nodeKeyService) {
+        this.nodeKeyService = nodeKeyService;
+    }
 
     /**
      * {@inheritDoc}
@@ -60,34 +59,12 @@ public class CryptoEngineFactory implements EngineFactory {
     }
 
     /**
-     * Create a separate KeyIvResolver for translog encryption.
+     * Create a KeyIvResolver for translog encryption using the shared node-level resolver.
      */
     private KeyIvResolver createTranslogKeyIvResolver(EngineConfig config) throws IOException {
-        // Create a separate key resolver for translog files
-
-        // Use the translog location for key storage
-        Path translogPath = config.getTranslogConfig().getTranslogPath();
-        Directory keyDirectory = FSDirectory.open(translogPath);
-
-        // Create crypto directory factory to get the key provider
-        CryptoDirectoryFactory directoryFactory = new CryptoDirectoryFactory();
-
-        // Build settings for TTL configuration (same as CryptoDirectoryFactory)
-        Settings ttlSettings = Settings
-            .builder()
-            .put(
-                "index.store.kms.data_key_ttl_seconds",
-                config.getIndexSettings().getValue(CryptoDirectoryFactory.KMS_DATA_KEY_TTL_SECONDS_SETTING)
-            )
-            .build();
-
-        // Create a dedicated key resolver for translog with consistent TTL settings
-        return new DefaultKeyIvResolver(
-            keyDirectory,
-            config.getIndexSettings().getValue(CryptoDirectoryFactory.INDEX_CRYPTO_PROVIDER_SETTING),
-            directoryFactory.getKeyProvider(config.getIndexSettings()),
-            ttlSettings
-        );
+        // Use the same shared node-level resolver for translog encryption
+        // This ensures both index data and translog use the same keys
+        return nodeKeyService.getResolver(config.getIndexSettings());
     }
 
 }
