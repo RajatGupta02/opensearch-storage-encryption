@@ -118,8 +118,9 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
     protected Directory newFSDirectory(Path location, LockFactory lockFactory, IndexSettings indexSettings) throws IOException {
         final Provider provider = indexSettings.getValue(INDEX_CRYPTO_PROVIDER_SETTING);
 
-        // Use index-level key resolver - store keys at index level, not shard level
-        Path indexDirectory = location.getParent(); // Go up from shard to index directory
+        // Use index-level key resolver - store keys at index level
+
+        Path indexDirectory = location.getParent().getParent(); // Go up two levels: index -> shard -> index
         MasterKeyProvider keyProvider = getKeyProvider(indexSettings);
 
         // Create a directory for the index-level keys
