@@ -17,7 +17,7 @@ import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.engine.InternalEngine;
-import org.opensearch.index.store.iv.DefaultKeyIvResolver;
+import org.opensearch.index.store.iv.IndexKeyResolverRegistry;
 import org.opensearch.index.store.iv.KeyIvResolver;
 import org.opensearch.index.translog.CryptoTranslogFactory;
 
@@ -63,12 +63,12 @@ public class CryptoEngineFactory implements EngineFactory {
     }
 
     /**
-     * Create a KeyIvResolver for translog encryption using index-level keys.
+     * Create a KeyIvResolver for translog encryption using shared index-level keys.
+     * This uses the same resolver registry as CryptoDirectoryFactory to prevent race conditions.
      */
     private KeyIvResolver createTranslogKeyIvResolver(EngineConfig config) throws IOException {
         // Use index-level keys for translog encryption - same as directory encryption
         Path translogPath = config.getTranslogConfig().getTranslogPath();
-
         Path indexDirectory = translogPath.getParent().getParent(); // Go up two levels: translog -> shard -> index
 
         // Get the same settings that CryptoDirectoryFactory uses
@@ -78,8 +78,10 @@ public class CryptoEngineFactory implements EngineFactory {
         // Create directory for index-level keys (same as CryptoDirectoryFactory)
         Directory indexKeyDirectory = FSDirectory.open(indexDirectory);
 
-        // Use the same DefaultKeyIvResolver with index-level keys
-        return new DefaultKeyIvResolver(indexKeyDirectory, provider, keyProvider, config.getIndexSettings().getSettings());
+        // Use shared resolver registry to get the SAME resolver instance as CryptoDirectoryFactory
+        String indexUuid = config.getIndexSettings().getIndex().getUUID();
+        return IndexKeyResolverRegistry
+            .getOrCreateResolver(indexUuid, indexKeyDirectory, provider, keyProvider, config.getIndexSettings().getSettings());
     }
 
     /**

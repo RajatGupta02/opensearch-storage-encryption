@@ -30,7 +30,7 @@ import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.index.store.hybrid.HybridCryptoDirectory;
-import org.opensearch.index.store.iv.DefaultKeyIvResolver;
+import org.opensearch.index.store.iv.IndexKeyResolverRegistry;
 import org.opensearch.index.store.iv.KeyIvResolver;
 import org.opensearch.index.store.mmap.EagerDecryptedCryptoMMapDirectory;
 import org.opensearch.index.store.mmap.LazyDecryptedCryptoMMapDirectory;
@@ -124,7 +124,11 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
 
         // Create a directory for the index-level keys
         Directory indexKeyDirectory = FSDirectory.open(indexDirectory);
-        KeyIvResolver keyIvResolver = new DefaultKeyIvResolver(indexKeyDirectory, provider, keyProvider, indexSettings.getSettings());
+
+        // Use shared resolver registry to prevent race conditions
+        String indexUuid = indexSettings.getIndex().getUUID();
+        KeyIvResolver keyIvResolver = IndexKeyResolverRegistry
+            .getOrCreateResolver(indexUuid, indexKeyDirectory, provider, keyProvider, indexSettings.getSettings());
 
         IndexModule.Type type = IndexModule.defaultStoreType(IndexModule.NODE_STORE_ALLOW_MMAP.get(indexSettings.getNodeSettings()));
         Set<String> preLoadExtensions = new HashSet<>(indexSettings.getValue(IndexModule.INDEX_STORE_PRE_LOAD_SETTING));
