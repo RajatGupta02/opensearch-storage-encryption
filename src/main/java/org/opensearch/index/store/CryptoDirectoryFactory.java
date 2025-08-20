@@ -16,8 +16,8 @@ import java.util.function.Function;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.LockFactory;
-import org.apache.lucene.store.NIOFSDirectory;
 import org.opensearch.cluster.metadata.CryptoMetadata;
 import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.crypto.MasterKeyProvider;
@@ -30,6 +30,7 @@ import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.index.store.hybrid.HybridCryptoDirectory;
+import org.opensearch.index.store.iv.DefaultKeyIvResolver;
 import org.opensearch.index.store.iv.KeyIvResolver;
 import org.opensearch.index.store.mmap.EagerDecryptedCryptoMMapDirectory;
 import org.opensearch.index.store.mmap.LazyDecryptedCryptoMMapDirectory;
@@ -38,20 +39,17 @@ import org.opensearch.plugins.IndexStorePlugin;
 
 @SuppressForbidden(reason = "temporary")
 /**
- * Factory for an encrypted filesystem directory
+ * Factory for an encrypted filesystem directory with index-level key management
  */
 public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory {
 
     private static final Logger LOGGER = LogManager.getLogger(CryptoDirectoryFactory.class);
 
-    private final NodeKeyService nodeKeyService;
-
     /**
-     * Creates a new CryptoDirectoryFactory with node-level key service
+     * Creates a new CryptoDirectoryFactory for index-level encryption
      */
-    public CryptoDirectoryFactory(NodeKeyService nodeKeyService) {
+    public CryptoDirectoryFactory() {
         super();
-        this.nodeKeyService = nodeKeyService;
     }
 
     /**
@@ -119,10 +117,14 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
      */
     protected Directory newFSDirectory(Path location, LockFactory lockFactory, IndexSettings indexSettings) throws IOException {
         final Provider provider = indexSettings.getValue(INDEX_CRYPTO_PROVIDER_SETTING);
-        Directory baseDir = new NIOFSDirectory(location, lockFactory);
 
-        // Use node-level key resolver based on index settings
-        KeyIvResolver keyIvResolver = nodeKeyService.getResolver(indexSettings);
+        // Use index-level key resolver - store keys at index level, not shard level
+        Path indexDirectory = location.getParent(); // Go up from shard to index directory
+        MasterKeyProvider keyProvider = getKeyProvider(indexSettings);
+
+        // Create a directory for the index-level keys
+        Directory indexKeyDirectory = FSDirectory.open(indexDirectory);
+        KeyIvResolver keyIvResolver = new DefaultKeyIvResolver(indexKeyDirectory, provider, keyProvider, indexSettings.getSettings());
 
         IndexModule.Type type = IndexModule.defaultStoreType(IndexModule.NODE_STORE_ALLOW_MMAP.get(indexSettings.getNodeSettings()));
         Set<String> preLoadExtensions = new HashSet<>(indexSettings.getValue(IndexModule.INDEX_STORE_PRE_LOAD_SETTING));

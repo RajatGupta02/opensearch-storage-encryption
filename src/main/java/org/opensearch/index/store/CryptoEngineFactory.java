@@ -5,13 +5,19 @@
 package org.opensearch.index.store;
 
 import java.io.IOException;
+import java.nio.file.Path;
+import java.security.Provider;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FSDirectory;
+import org.opensearch.common.crypto.MasterKeyProvider;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.engine.InternalEngine;
+import org.opensearch.index.store.iv.DefaultKeyIvResolver;
 import org.opensearch.index.store.iv.KeyIvResolver;
 import org.opensearch.index.translog.CryptoTranslogFactory;
 
@@ -22,13 +28,11 @@ public class CryptoEngineFactory implements EngineFactory {
 
     private static final Logger logger = LogManager.getLogger(CryptoEngineFactory.class);
 
-    private final NodeKeyService nodeKeyService;
-
     /**
-     * Constructor with node-level key service.
+     * Constructor for index-level encryption.
      */
-    public CryptoEngineFactory(NodeKeyService nodeKeyService) {
-        this.nodeKeyService = nodeKeyService;
+    public CryptoEngineFactory() {
+        // No dependencies needed for index-level encryption
     }
 
     /**
@@ -59,12 +63,31 @@ public class CryptoEngineFactory implements EngineFactory {
     }
 
     /**
-     * Create a KeyIvResolver for translog encryption using the shared node-level resolver.
+     * Create a KeyIvResolver for translog encryption using index-level keys.
      */
     private KeyIvResolver createTranslogKeyIvResolver(EngineConfig config) throws IOException {
-        // Use the same shared node-level resolver for translog encryption
-        // This ensures both index data and translog use the same keys
-        return nodeKeyService.getResolver(config.getIndexSettings());
+        // Use index-level keys for translog encryption - same as directory encryption
+        Path translogPath = config.getTranslogConfig().getTranslogPath();
+
+        Path indexDirectory = translogPath.getParent().getParent(); // Go up two levels: translog -> shard -> index
+
+        // Get the same settings that CryptoDirectoryFactory uses
+        Provider provider = config.getIndexSettings().getValue(CryptoDirectoryFactory.INDEX_CRYPTO_PROVIDER_SETTING);
+        MasterKeyProvider keyProvider = getKeyProvider(config);
+
+        // Create directory for index-level keys (same as CryptoDirectoryFactory)
+        Directory indexKeyDirectory = FSDirectory.open(indexDirectory);
+
+        // Use the same DefaultKeyIvResolver with index-level keys
+        return new DefaultKeyIvResolver(indexKeyDirectory, provider, keyProvider, config.getIndexSettings().getSettings());
+    }
+
+    /**
+     * Get the MasterKeyProvider - copied from CryptoDirectoryFactory logic
+     */
+    private MasterKeyProvider getKeyProvider(EngineConfig config) {
+        // Reuse the same logic as CryptoDirectoryFactory
+        return new CryptoDirectoryFactory().getKeyProvider(config.getIndexSettings());
     }
 
 }
