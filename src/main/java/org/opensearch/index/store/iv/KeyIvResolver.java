@@ -18,11 +18,35 @@ import java.security.Key;
 public interface KeyIvResolver {
 
     /**
+     * Component types that use the resolver to control KMS refresh behavior
+     */
+    enum ComponentType {
+        /**
+         * Index operations - can trigger KMS refresh, can fail on KMS unavailability
+         */
+        INDEX,
+
+        /**
+         * Translog operations - never trigger KMS refresh, use the updated key if available but never fail on KMS unavailability
+         */
+        TRANSLOG
+    }
+
+    /**
      * Returns the symmetric encryption key used for cipher operations.
+     * Uses default behavior (INDEX component type) for backward compatibility.
      *
      * @return the decrypted symmetric {@link Key}, typically AES
      */
     Key getDataKey();
+
+    /**
+     * Returns the symmetric encryption key with component-specific behavior.
+     * 
+     * @param componentType the component type requesting the key
+     * @return the decrypted symmetric {@link Key}, typically AES
+     */
+    Key getDataKey(ComponentType componentType);
 
     /**
      * Returns the raw initialization vector (IV) used with the cipher.

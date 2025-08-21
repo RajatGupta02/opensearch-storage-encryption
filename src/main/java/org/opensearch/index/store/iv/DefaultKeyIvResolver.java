@@ -171,11 +171,21 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
 
     /**
      * {@inheritDoc}
-     * Returns the data key, using TTL-based refresh with pre-emptive KMS calls.
-     * Index operations are never blocked by KMS calls.
+     * Returns the data key using default behavior (INDEX component type) for backward compatibility.
      */
     @Override
     public Key getDataKey() {
+        return getDataKey(ComponentType.INDEX);
+    }
+
+    /**
+     * {@inheritDoc}
+     * Returns the data key with component-specific behavior for KMS refresh.
+     * INDEX operations can trigger KMS refresh and fail on unavailability.
+     * TRANSLOG operations never trigger KMS refresh and never fail.
+     */
+    @Override
+    public Key getDataKey(ComponentType componentType) {
         DataKeyHolder current = dataKeyRef.get();
 
         // Handle first-time initialization (should not happen after initialize())
@@ -203,38 +213,78 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
             }
         }
 
-        // Check if pre-emptive refresh needed (at 80% of TTL)
+        // Pre-emptive refresh - only INDEX operations can trigger this
         if (current.needsRefresh(ttlMillis, REFRESH_THRESHOLD)) {
-            // Non-blocking: try to start refresh
-            if (refreshInProgress.compareAndSet(false, true)) {
-                try {
-                    byte[] encryptedKey = readByteArrayFile(KEY_FILE);
-                    byte[] decryptedKey = keyProvider.decryptKey(encryptedKey);
-                    Key newKey = new SecretKeySpec(decryptedKey, "AES");
-
-                    // Atomic update - only after successful KMS call
-                    DataKeyHolder newHolder = new DataKeyHolder(newKey, System.currentTimeMillis());
-                    dataKeyRef.set(newHolder);
-
-                    logger.debug("Successfully refreshed data key from KMS pre-emptively");
-
-                } catch (Exception e) {
-                    // Log error but don't fail - current key continues to work
-                    logger.warn("Pre-emptive data key refresh failed, will retry later", e);
-
-                    // Check if current key is truly expired (safety net)
-                    if (current.isExpired(ttlMillis)) {
-                        // This is critical - expired key and refresh failed
-                        logger.error("Data key is expired and refresh failed", e);
-                        throw new RuntimeException("Data key expired and KMS refresh failed", e);
-                    }
-                } finally {
-                    refreshInProgress.set(false);
-                }
+            if (componentType == ComponentType.INDEX) {
+                attemptPreemptiveRefresh();
+                // Get updated reference after potential refresh
+                current = dataKeyRef.get();
             }
+            // TRANSLOG operations: do nothing, use current key
+        }
+
+        // Handle expiration with component-specific behavior
+        if (current.isExpired(ttlMillis)) {
+            return handleExpiredKey(current, componentType);
         }
 
         return current.getDataKey();
+    }
+
+    /**
+     * Attempts pre-emptive refresh of the data key (only called by INDEX operations).
+     */
+    private void attemptPreemptiveRefresh() {
+        if (refreshInProgress.compareAndSet(false, true)) {
+            try {
+                refreshKeyFromKMS();
+                logger.debug("Successfully refreshed data key pre-emptively (triggered by index operations)");
+            } catch (Exception e) {
+                logger.warn("Pre-emptive data key refresh failed, will retry later", e);
+            } finally {
+                refreshInProgress.set(false);
+            }
+        }
+    }
+
+    /**
+     * Handles expired key based on component type.
+     */
+    private Key handleExpiredKey(DataKeyHolder current, ComponentType componentType) {
+        switch (componentType) {
+            case INDEX:
+                // Index operations: try refresh, fail if unsuccessful
+                logger.debug("Data key expired for index operations, attempting KMS refresh");
+                try {
+                    return refreshKeyFromKMS();
+                } catch (Exception e) {
+                    logger.error("Data key expired and KMS refresh failed for index operations", e);
+                    throw new RuntimeException("Data key expired and KMS refresh failed", e);
+                }
+
+            case TRANSLOG:
+                // Translog operations: never fail, use expired key
+                logger.warn("Using expired key for translog operations (KMS refresh not attempted)");
+                return current.getDataKey();
+
+            default:
+                throw new IllegalArgumentException("Unknown component type: " + componentType);
+        }
+    }
+
+    /**
+     * Refreshes the data key from KMS and updates the shared reference.
+     */
+    private Key refreshKeyFromKMS() throws Exception {
+        byte[] encryptedKey = readByteArrayFile(KEY_FILE);
+        byte[] decryptedKey = keyProvider.decryptKey(encryptedKey);
+        Key newKey = new SecretKeySpec(decryptedKey, "AES");
+
+        // Atomic update of shared datakey reference
+        DataKeyHolder newHolder = new DataKeyHolder(newKey, System.currentTimeMillis());
+        dataKeyRef.set(newHolder);
+
+        return newKey;
     }
 
     /**

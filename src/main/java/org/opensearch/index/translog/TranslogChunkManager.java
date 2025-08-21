@@ -190,7 +190,7 @@ public class TranslogChunkManager {
             buffer.get(encryptedWithTag);
 
             // Use existing key management
-            Key key = keyIvResolver.getDataKey();
+            Key key = keyIvResolver.getDataKey(KeyIvResolver.ComponentType.TRANSLOG);
             byte[] baseIV = keyIvResolver.getIvBytes();
 
             // Use existing IV computation for this chunk
@@ -211,7 +211,7 @@ public class TranslogChunkManager {
     public void encryptAndWriteChunk(int chunkIndex, byte[] plainData) throws IOException {
         try {
             // Use existing key management
-            Key key = keyIvResolver.getDataKey();
+            Key key = keyIvResolver.getDataKey(KeyIvResolver.ComponentType.TRANSLOG);
             byte[] baseIV = keyIvResolver.getIvBytes();
 
             // Use existing IV computation for this chunk
