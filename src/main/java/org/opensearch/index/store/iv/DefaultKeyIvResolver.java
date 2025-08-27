@@ -25,6 +25,9 @@ import org.opensearch.common.crypto.DataKeyPair;
 import org.opensearch.common.crypto.MasterKeyProvider;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.index.store.cipher.AesCipherFactory;
+import org.opensearch.index.store.kms.KmsFailureClassifier;
+import org.opensearch.index.store.kms.KmsFailureType;
+import org.opensearch.index.store.kms.KmsHealthMonitor;
 
 /**
  * Default implementation of {@link KeyIvResolver} responsible for managing
@@ -49,6 +52,10 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     private final AtomicReference<DataKeyHolder> dataKeyRef = new AtomicReference<>();
     private final AtomicBoolean refreshInProgress = new AtomicBoolean(false);
 
+    // Circuit breaker state for non-retryable KMS failures
+    private volatile boolean nonRetryableFailureDetected = false;
+    private volatile KmsFailureType permanentFailureType;
+
     // Pre-emptive refresh at 80% of TTL to avoid blocking
     private static final double REFRESH_THRESHOLD = 0.8;
 
@@ -71,8 +78,8 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
         this.directory = directory;
         this.keyProvider = keyProvider;
 
-        // Read TTL from settings (default 5 minutes)
-        int ttlSeconds = settings.getAsInt("index.store.kms.data_key_ttl_seconds", 300);
+        // Read TTL from settings (default 1 hour)
+        int ttlSeconds = settings.getAsInt("index.store.kms.data_key_ttl_seconds", 3600);
         this.ttlMillis = ttlSeconds * 1000L;
 
         initialize();
@@ -186,6 +193,11 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
      */
     @Override
     public Key getDataKey(ComponentType componentType) {
+        // Circuit breaker check - fail fast for non-retryable failures
+        if (nonRetryableFailureDetected) {
+            throw new RuntimeException("KMS access revoked due to previous " + permanentFailureType + " failure");
+        }
+
         DataKeyHolder current = dataKeyRef.get();
 
         // Handle first-time initialization (should not happen after initialize())
@@ -253,13 +265,26 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     private Key handleExpiredKey(DataKeyHolder current, ComponentType componentType) {
         switch (componentType) {
             case INDEX:
-                // Index operations: try refresh, fail if unsuccessful
+                // Index operations: try refresh, handle failure based on type
                 logger.debug("Data key expired for index operations, attempting KMS refresh");
                 try {
                     return refreshKeyFromKMS();
                 } catch (Exception e) {
-                    logger.error("Data key expired and KMS refresh failed for index operations", e);
-                    throw new RuntimeException("Data key expired and KMS refresh failed", e);
+                    // Classify failure type for appropriate handling
+                    KmsFailureType failureType = KmsFailureClassifier.classify(e);
+
+                    if (KmsFailureClassifier.isRetryable(failureType)) {
+                        // Retryable failure: use existing key if available
+                        if (current != null) {
+                            logger.warn("KMS refresh failed (retryable): {}. Using expired key for index operations.", e.getMessage());
+                            return current.getDataKey();
+                        } else {
+                            throw new RuntimeException("KMS refresh failed (retryable) and no existing key available", e);
+                        }
+                    } else {
+                        // Non-retryable failure: circuit breaker already set in refreshKeyFromKMS, fail immediately
+                        throw new RuntimeException("KMS key unavailable: " + e.getMessage(), e);
+                    }
                 }
 
             case TRANSLOG:
@@ -276,15 +301,37 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
      * Refreshes the data key from KMS and updates the shared reference.
      */
     private Key refreshKeyFromKMS() throws Exception {
-        byte[] encryptedKey = readByteArrayFile(KEY_FILE);
-        byte[] decryptedKey = keyProvider.decryptKey(encryptedKey);
-        Key newKey = new SecretKeySpec(decryptedKey, "AES");
+        try {
+            byte[] encryptedKey = readByteArrayFile(KEY_FILE);
+            byte[] decryptedKey = keyProvider.decryptKey(encryptedKey);
+            Key newKey = new SecretKeySpec(decryptedKey, "AES");
 
-        // Atomic update of shared datakey reference
-        DataKeyHolder newHolder = new DataKeyHolder(newKey, System.currentTimeMillis());
-        dataKeyRef.set(newHolder);
+            // Atomic update of shared datakey reference
+            DataKeyHolder newHolder = new DataKeyHolder(newKey, System.currentTimeMillis());
+            dataKeyRef.set(newHolder);
 
-        return newKey;
+            return newKey;
+
+        } catch (Exception e) {
+            // Classify KMS failure type
+            KmsFailureType failureType = KmsFailureClassifier.classify(e);
+
+            if (!KmsFailureClassifier.isRetryable(failureType)) {
+                // Set circuit breaker for non-retryable failures
+                nonRetryableFailureDetected = true;
+                permanentFailureType = failureType;
+
+                // Register with health monitor for automatic recovery
+                KmsHealthMonitor.safeRegisterFailedResolver(this, failureType);
+
+                logger.error("KMS key access failed (non-retryable): {}. Circuit breaker activated.", e.getMessage());
+            } else {
+                logger.warn("KMS refresh failed (retryable): {}. Will retry on next TTL cycle.", e.getMessage());
+            }
+
+            // Re-throw the original exception
+            throw e;
+        }
     }
 
     /**
@@ -293,6 +340,49 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     @Override
     public byte[] getIvBytes() {
         return Base64.getDecoder().decode(iv);
+    }
+
+    /**
+     * Tests KMS connectivity without affecting normal operations.
+     * This method is called by the KMS health monitor to test if KMS has recovered.
+     * 
+     * @throws Exception if KMS is still unavailable
+     */
+    public void testKmsConnectivity() throws Exception {
+        // Test by attempting to decrypt the existing encrypted key
+        byte[] encryptedKey = readByteArrayFile(KEY_FILE);
+        keyProvider.decryptKey(encryptedKey);
+        // If we reach here, KMS is accessible
+    }
+
+    /**
+     * Resets the circuit breaker state, allowing KMS operations to resume.
+     * This should only be called by the KMS health monitor after confirming KMS recovery.
+     */
+    public void resetCircuitBreaker() {
+        if (nonRetryableFailureDetected) {
+            nonRetryableFailureDetected = false;
+            permanentFailureType = null;
+            logger.info("Circuit breaker reset - KMS operations can resume");
+        }
+    }
+
+    /**
+     * Checks if the circuit breaker is currently active.
+     * 
+     * @return true if circuit breaker is active (KMS operations blocked)
+     */
+    public boolean isCircuitBreakerActive() {
+        return nonRetryableFailureDetected;
+    }
+
+    /**
+     * Gets the failure type that triggered the circuit breaker.
+     * 
+     * @return the failure type, or null if circuit breaker is not active
+     */
+    public KmsFailureType getCircuitBreakerFailureType() {
+        return permanentFailureType;
     }
 
 }

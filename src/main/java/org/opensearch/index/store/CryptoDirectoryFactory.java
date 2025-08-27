@@ -73,10 +73,10 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
     }, Property.NodeScope, Property.IndexScope);
 
     /**
-     * Specifies the TTL for data keys in seconds before they are refreshed from KMS. Default is 300 seconds (5 minutes).
+     * Specifies the TTL for data keys in seconds before they are refreshed from KMS. Default is 3600 seconds (1 hour).
      */
     public static final Setting<Integer> KMS_DATA_KEY_TTL_SECONDS_SETTING = Setting
-        .intSetting("index.store.kms.data_key_ttl_seconds", 300, 1, Property.NodeScope, Property.IndexScope);
+        .intSetting("index.store.kms.data_key_ttl_seconds", 3600, 1, Property.NodeScope, Property.IndexScope);
 
     MasterKeyProvider getKeyProvider(IndexSettings indexSettings) {
         final String KEY_PROVIDER_TYPE = indexSettings.getValue(INDEX_KMS_TYPE_SETTING);
