@@ -10,6 +10,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
@@ -22,6 +24,8 @@ import org.opensearch.plugins.Plugin;
  * A plugin that enables index level encryption and decryption.
  */
 public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, EnginePlugin {
+
+    private static final Logger LOGGER = LogManager.getLogger(CryptoDirectoryFactory.class);
 
     /**
      * The default constructor.
@@ -49,6 +53,16 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
     @Override
     public Map<String, DirectoryFactory> getDirectoryFactories() {
         return Collections.singletonMap("cryptofs", new CryptoDirectoryFactory());
+    }
+
+    @Override
+    public void onIndexModule(IndexModule indexModule) {
+        LOGGER.info("!!!!! onIndexModule triggered!!!!");
+        try {
+            Thread.sleep(5 * 60 * 1000);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
     }
 
     /**
