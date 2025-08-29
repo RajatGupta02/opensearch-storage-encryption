@@ -58,19 +58,19 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
     @Override
     public void onIndexModule(IndexModule indexModule) {
         LOGGER.info("!!!!! testing that onIndexModule triggered!!!!");
-            // Create background thread that prints "hello world" every 10 seconds
+        // Create background thread that prints "hello world" every 10 seconds
         Thread backgroundThread = new Thread(() -> {
             while (true) {
                 try {
-                    Thread.sleep(10000); // 10 seconds
-                    LOGGER.info("hello world");
+                    Thread.sleep(15000); // 15 seconds
+                    LOGGER.info("hello world from: {}", indexModule.getIndex());
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
                 }
             }
         });
-        
+
         backgroundThread.setDaemon(true);
         backgroundThread.setName("CryptoPlugin-HelloWorld-Thread");
         backgroundThread.start();
