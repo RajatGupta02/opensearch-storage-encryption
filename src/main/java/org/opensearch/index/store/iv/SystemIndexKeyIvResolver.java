@@ -16,6 +16,7 @@ import javax.crypto.spec.SecretKeySpec;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.action.DocWriteRequest;
 import org.opensearch.action.DocWriteResponse;
 import org.opensearch.action.get.GetRequest;
 import org.opensearch.action.get.GetResponse;
@@ -27,6 +28,7 @@ import org.opensearch.common.crypto.MasterKeyProvider;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.xcontent.ToXContent;
+import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.index.store.cipher.AesCipherFactory;
 import org.opensearch.index.store.systemindex.CryptoKeyDocument;
 import org.opensearch.index.store.systemindex.CryptoSystemIndexDescriptor;
@@ -231,6 +233,8 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
 
     /**
      * Creates a new data key, encrypts it with KMS, and stores it in the system index.
+     * Uses atomic CREATE operation to handle race conditions where multiple threads
+     * try to create keys for the same index simultaneously.
      *
      * @return the new decrypted data key
      * @throws IOException if key creation or storage fails
@@ -265,36 +269,61 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
                 ALGORITHM
             );
 
-            // Store in system index
+            // Store in system index with CREATE-only semantics to handle race conditions
             IndexRequest indexRequest = new IndexRequest(CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME)
                 .id(document.getDocumentId())
                 .source(
                     document.toXContent(org.opensearch.common.xcontent.XContentFactory.jsonBuilder(), ToXContent.EMPTY_PARAMS).toString(),
                     XContentType.JSON
                 )
-                .setRefreshPolicy("wait_for");
+                .setRefreshPolicy("wait_for")
+                .opType(DocWriteRequest.OpType.CREATE); // KEY CHANGE: Only create, fail if exists
 
-            IndexResponse indexResponse = client.index(indexRequest).actionGet();
+            try {
+                IndexResponse indexResponse = client.index(indexRequest).actionGet();
 
-            if (indexResponse.getResult() == DocWriteResponse.Result.CREATED
-                || indexResponse.getResult() == DocWriteResponse.Result.UPDATED) {
+                if (indexResponse.getResult() == DocWriteResponse.Result.CREATED) {
+                    // Success - we won the race, cache and return our key
+                    Key dataKey = new SecretKeySpec(decryptedKeyBytes, ALGORITHM);
+                    keyCache.put(indexUuid, dataKey);
+                    ivCache.put(indexUuid, ivBytes);
 
-                // Create data key and cache both key and IV
-                Key dataKey = new SecretKeySpec(decryptedKeyBytes, ALGORITHM);
-                keyCache.put(indexUuid, dataKey);
-                ivCache.put(indexUuid, ivBytes);
+                    logger.info("Successfully created and stored new crypto key for index: {} in system index", indexUuid);
+                    return dataKey;
+                } else {
+                    throw new IOException("Unexpected index response: " + indexResponse.getResult());
+                }
 
-                logger.info("Successfully created and stored new crypto key for index: {} in system index", indexUuid);
-                return dataKey;
-
-            } else {
-                throw new IOException("Failed to store crypto key document: " + indexResponse.getResult());
+            } catch (VersionConflictEngineException e) {
+                // Document was created by another thread - fetch the existing one
+                logger.info("Crypto key document already exists for index: {}, fetching existing key", indexUuid);
+                return fetchExistingKey();
             }
 
+        } catch (VersionConflictEngineException e) {
+            // Handle race condition - another thread created the document first
+            logger.info("Race condition detected for index: {}, fetching existing key", indexUuid);
+            return fetchExistingKey();
         } catch (Exception e) {
             logger.error("Failed to create and store new crypto key for index: {}", indexUuid, e);
             throw new IOException("Failed to create new crypto key", e);
         }
+    }
+
+    /**
+     * Fetches an existing key from the system index when creation fails due to race condition.
+     * Clears cache first to ensure fresh read of the winning thread's key/IV.
+     *
+     * @return the existing decrypted data key
+     * @throws IOException if fetching fails
+     */
+    private Key fetchExistingKey() throws IOException {
+        // Clear cache first to force fresh read from system index
+        keyCache.remove(indexUuid);
+        ivCache.remove(indexUuid);
+
+        // Retry the original fetch logic - this will read the document created by the winning thread
+        return fetchOrCreateDataKey();
     }
 
     /**
