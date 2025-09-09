@@ -27,6 +27,8 @@ import org.opensearch.env.NodeEnvironment;
 import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
+import org.opensearch.index.store.iv.KeyIvResolver;
+import org.opensearch.index.store.iv.SystemIndexKeyIvResolver;
 import org.opensearch.index.store.systemindex.CryptoSystemIndexDescriptor;
 import org.opensearch.index.store.systemindex.SystemIndexManager;
 import org.opensearch.indices.SystemIndexDescriptor;
@@ -50,6 +52,9 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
 
     // Map to track running background threads per index UUID
     private final ConcurrentHashMap<String, Thread> backgroundThreads = new ConcurrentHashMap<>();
+
+    // Shared resolver cache to ensure consistent keys/IVs across directory and engine operations
+    private final ConcurrentHashMap<String, KeyIvResolver> resolverCache = new ConcurrentHashMap<>();
 
     // Dependencies injected via createComponents
     private Client client;
@@ -107,7 +112,8 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
      */
     @Override
     public Map<String, DirectoryFactory> getDirectoryFactories() {
-        return Collections.singletonMap("cryptofs", new CryptoDirectoryFactory(() -> this.client, () -> this.systemIndexManager));
+        return Collections
+            .singletonMap("cryptofs", new CryptoDirectoryFactory(() -> this.client, () -> this.systemIndexManager, () -> this));
     }
 
     // @Override
@@ -204,7 +210,7 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
     public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings) {
         // Only provide our custom engine factory for cryptofs indices
         if ("cryptofs".equals(indexSettings.getValue(IndexModule.INDEX_STORE_TYPE_SETTING))) {
-            return Optional.of(new CryptoEngineFactory(() -> this.client, () -> this.systemIndexManager));
+            return Optional.of(new CryptoEngineFactory(() -> this.client, () -> this.systemIndexManager, () -> this));
         }
         return Optional.empty();
     }
@@ -215,6 +221,91 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
     @Override
     public Collection<SystemIndexDescriptor> getSystemIndexDescriptors(Settings settings) {
         return Collections.singletonList(CryptoSystemIndexDescriptor.getDescriptor());
+    }
+
+    /**
+     * Gets or creates a shared KeyIvResolver for the given index settings.
+     * This ensures that both directory and engine operations use the same resolver instance,
+     * preventing key/IV inconsistencies that can cause CorruptIndexException.
+     * 
+     * @param indexSettings the index settings
+     * @return the shared KeyIvResolver for this index
+     */
+    public KeyIvResolver getOrCreateSharedResolver(IndexSettings indexSettings) {
+        String indexUuid = indexSettings.getIndex().getUUID();
+
+        // Return existing resolver if cached
+        KeyIvResolver existingResolver = resolverCache.get(indexUuid);
+        if (existingResolver != null) {
+            LOGGER.debug("Returning cached resolver for index: {}", indexUuid);
+            return existingResolver;
+        }
+
+        // Create new resolver with thread-safe cache operation
+        KeyIvResolver newResolver = resolverCache.computeIfAbsent(indexUuid, uuid -> {
+            try {
+                LOGGER.info("Creating new shared resolver for index: {}", uuid);
+
+                // Get the same settings that both factories use
+                java.security.Provider provider = indexSettings.getValue(CryptoDirectoryFactory.INDEX_CRYPTO_PROVIDER_SETTING);
+                String kmsKeyId = indexSettings.getValue(CryptoDirectoryFactory.INDEX_KMS_KEY_ID_SETTING);
+
+                // Create key provider
+                final String keyProviderType = indexSettings.getValue(CryptoDirectoryFactory.INDEX_KMS_TYPE_SETTING);
+                final Settings settings = Settings.builder().put(indexSettings.getNodeSettings(), false).build();
+                org.opensearch.cluster.metadata.CryptoMetadata cryptoMetadata = new org.opensearch.cluster.metadata.CryptoMetadata(
+                    "",
+                    keyProviderType,
+                    settings
+                );
+
+                org.opensearch.common.crypto.MasterKeyProvider keyProvider;
+                try {
+                    keyProvider = org.opensearch.crypto.CryptoHandlerRegistry
+                        .getInstance()
+                        .getCryptoKeyProviderPlugin(keyProviderType)
+                        .createKeyProvider(cryptoMetadata);
+                } catch (NullPointerException npe) {
+                    throw new RuntimeException("could not find key provider: " + keyProviderType, npe);
+                }
+
+                return new SystemIndexKeyIvResolver(
+                    getClient(),
+                    uuid,
+                    kmsKeyId,
+                    provider,
+                    keyProvider,
+                    indexSettings.getSettings(),
+                    getSystemIndexManager()
+                );
+            } catch (Exception e) {
+                LOGGER.error("Failed to create shared resolver for index: {}", uuid, e);
+                throw new RuntimeException("Failed to create shared KeyIvResolver", e);
+            }
+        });
+
+        LOGGER.info("Using shared resolver for index: {} (cache size: {})", indexUuid, resolverCache.size());
+        return newResolver;
+    }
+
+    /**
+     * Gets the client, throwing an exception if not available.
+     */
+    private Client getClient() {
+        if (client == null) {
+            throw new IllegalStateException("Client not available - plugin may not be fully initialized");
+        }
+        return client;
+    }
+
+    /**
+     * Gets the system index manager, throwing an exception if not available.
+     */
+    private SystemIndexManager getSystemIndexManager() {
+        if (systemIndexManager == null) {
+            throw new IllegalStateException("SystemIndexManager not available - plugin may not be fully initialized");
+        }
+        return systemIndexManager;
     }
 
     /**

@@ -5,19 +5,16 @@
 package org.opensearch.index.store;
 
 import java.io.IOException;
-import java.security.Provider;
 import java.util.Objects;
 import java.util.function.Supplier;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.opensearch.common.crypto.MasterKeyProvider;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.store.iv.KeyIvResolver;
-import org.opensearch.index.store.iv.SystemIndexKeyIvResolver;
 import org.opensearch.index.store.systemindex.SystemIndexManager;
 import org.opensearch.index.translog.CryptoTranslogFactory;
 import org.opensearch.transport.client.Client;
@@ -32,16 +29,23 @@ public class CryptoEngineFactory implements EngineFactory {
 
     private final Supplier<Client> clientSupplier;
     private final Supplier<SystemIndexManager> systemIndexManagerSupplier;
+    private final Supplier<CryptoDirectoryPlugin> pluginSupplier;
 
     /**
-     * Constructor for system index-based encryption with lazy client and SystemIndexManager resolution.
+     * Constructor for system index-based encryption with lazy client, SystemIndexManager, and plugin resolution.
      * 
      * @param clientSupplier supplier that provides the client when needed
      * @param systemIndexManagerSupplier supplier that provides the SystemIndexManager when needed
+     * @param pluginSupplier supplier that provides the plugin instance for shared resolver access
      */
-    public CryptoEngineFactory(Supplier<Client> clientSupplier, Supplier<SystemIndexManager> systemIndexManagerSupplier) {
+    public CryptoEngineFactory(
+        Supplier<Client> clientSupplier,
+        Supplier<SystemIndexManager> systemIndexManagerSupplier,
+        Supplier<CryptoDirectoryPlugin> pluginSupplier
+    ) {
         this.clientSupplier = Objects.requireNonNull(clientSupplier, "Client supplier cannot be null");
         this.systemIndexManagerSupplier = Objects.requireNonNull(systemIndexManagerSupplier, "SystemIndexManager supplier cannot be null");
+        this.pluginSupplier = Objects.requireNonNull(pluginSupplier, "Plugin supplier cannot be null");
     }
 
     /**
@@ -106,34 +110,18 @@ public class CryptoEngineFactory implements EngineFactory {
     }
 
     /**
-     * Create a KeyIvResolver for translog encryption using the same system index approach
-     * as CryptoDirectoryFactory. This ensures both directory and translog use the same keys.
+     * Create a KeyIvResolver for translog encryption using the shared resolver from plugin.
+     * This ensures both directory and translog use the exact same resolver instance.
      */
     private KeyIvResolver createTranslogKeyIvResolver(EngineConfig config) throws IOException {
-        // Get the same settings that CryptoDirectoryFactory uses
-        Provider provider = config.getIndexSettings().getValue(CryptoDirectoryFactory.INDEX_CRYPTO_PROVIDER_SETTING);
-        MasterKeyProvider keyProvider = getKeyProvider(config);
-        String indexUuid = config.getIndexSettings().getIndex().getUUID();
-        String kmsKeyId = config.getIndexSettings().getValue(CryptoDirectoryFactory.INDEX_KMS_KEY_ID_SETTING);
+        // Use shared resolver from plugin to ensure consistency with directory operations
+        logger
+            .debug(
+                "Using shared resolver from plugin for translog encryption for index: {}",
+                config.getIndexSettings().getIndex().getUUID()
+            );
 
-        // Use system index-based key storage - same as CryptoDirectoryFactory
-        return new SystemIndexKeyIvResolver(
-            getClient(),
-            indexUuid,
-            kmsKeyId,
-            provider,
-            keyProvider,
-            config.getIndexSettings().getSettings(),
-            getSystemIndexManager()
-        );
-    }
-
-    /**
-     * Get the MasterKeyProvider - copied from CryptoDirectoryFactory logic
-     */
-    private MasterKeyProvider getKeyProvider(EngineConfig config) {
-        // Reuse the same logic as CryptoDirectoryFactory
-        return new CryptoDirectoryFactory(() -> getClient(), () -> getSystemIndexManager()).getKeyProvider(config.getIndexSettings());
+        return pluginSupplier.get().getOrCreateSharedResolver(config.getIndexSettings());
     }
 
 }

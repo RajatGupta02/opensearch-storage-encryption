@@ -212,7 +212,14 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
             keyCache.put(indexUuid, dataKey);
             ivCache.put(indexUuid, ivBytes);
 
-            logger.info("Successfully loaded and cached crypto key for index: {}", indexUuid);
+            // Log key/IV loading for debugging
+            logger
+                .info(
+                    "Successfully loaded and cached crypto key for index: {} - Key hash: {}, IV hash: {}",
+                    indexUuid,
+                    java.util.Arrays.hashCode(decryptedKeyBytes),
+                    java.util.Arrays.hashCode(ivBytes)
+                );
             return dataKey;
 
         } else {
@@ -239,6 +246,15 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
             byte[] ivBytes = new byte[AesCipherFactory.IV_ARRAY_LENGTH];
             SecureRandom random = Randomness.createSecure();
             random.nextBytes(ivBytes);
+
+            // Log key/IV creation for debugging
+            logger
+                .info(
+                    "Creating new crypto key for index: {} - Key hash: {}, IV hash: {}",
+                    indexUuid,
+                    java.util.Arrays.hashCode(decryptedKeyBytes),
+                    java.util.Arrays.hashCode(ivBytes)
+                );
 
             // Create document
             CryptoKeyDocument document = new CryptoKeyDocument(

@@ -32,7 +32,6 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.index.store.hybrid.HybridCryptoDirectory;
 import org.opensearch.index.store.iv.KeyIvResolver;
-import org.opensearch.index.store.iv.SystemIndexKeyIvResolver;
 import org.opensearch.index.store.mmap.EagerDecryptedCryptoMMapDirectory;
 import org.opensearch.index.store.mmap.LazyDecryptedCryptoMMapDirectory;
 import org.opensearch.index.store.niofs.CryptoNIOFSDirectory;
@@ -50,17 +49,24 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
 
     private final Supplier<Client> clientSupplier;
     private final Supplier<SystemIndexManager> systemIndexManagerSupplier;
+    private final Supplier<CryptoDirectoryPlugin> pluginSupplier;
 
     /**
-     * Creates a new CryptoDirectoryFactory with lazy client and system index manager resolution.
+     * Creates a new CryptoDirectoryFactory with lazy client, system index manager, and plugin resolution.
      * 
      * @param clientSupplier supplier that provides the client when needed
      * @param systemIndexManagerSupplier supplier that provides the system index manager when needed
+     * @param pluginSupplier supplier that provides the plugin instance for shared resolver access
      */
-    public CryptoDirectoryFactory(Supplier<Client> clientSupplier, Supplier<SystemIndexManager> systemIndexManagerSupplier) {
+    public CryptoDirectoryFactory(
+        Supplier<Client> clientSupplier,
+        Supplier<SystemIndexManager> systemIndexManagerSupplier,
+        Supplier<CryptoDirectoryPlugin> pluginSupplier
+    ) {
         this.clientSupplier = Objects.requireNonNull(clientSupplier, "Client supplier cannot be null");
         this.systemIndexManagerSupplier = Objects
             .requireNonNull(systemIndexManagerSupplier, "System index manager supplier cannot be null");
+        this.pluginSupplier = Objects.requireNonNull(pluginSupplier, "Plugin supplier cannot be null");
     }
 
     /**
@@ -177,18 +183,9 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
         MasterKeyProvider keyProvider = getKeyProvider(indexSettings);
         String indexUuid = indexSettings.getIndex().getUUID();
 
-        // Always use system index-based key storage
-        LOGGER.debug("Using system index-based key storage for index: {}", indexUuid);
-        String kmsKeyId = indexSettings.getValue(INDEX_KMS_KEY_ID_SETTING);
-        KeyIvResolver keyIvResolver = new SystemIndexKeyIvResolver(
-            getClient(),
-            indexUuid,
-            kmsKeyId,
-            provider,
-            keyProvider,
-            indexSettings.getSettings(),
-            getSystemIndexManager()
-        );
+        // Use shared resolver from plugin to ensure consistency with engine operations
+        LOGGER.debug("Using shared resolver from plugin for index: {}", indexUuid);
+        KeyIvResolver keyIvResolver = pluginSupplier.get().getOrCreateSharedResolver(indexSettings);
 
         IndexModule.Type type = IndexModule.defaultStoreType(IndexModule.NODE_STORE_ALLOW_MMAP.get(indexSettings.getNodeSettings()));
         Set<String> preLoadExtensions = new HashSet<>(indexSettings.getValue(IndexModule.INDEX_STORE_PRE_LOAD_SETTING));
