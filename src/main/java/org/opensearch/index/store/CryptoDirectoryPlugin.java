@@ -5,35 +5,54 @@
 package org.opensearch.index.store;
 
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Supplier;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.env.Environment;
+import org.opensearch.env.NodeEnvironment;
 import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.shard.IndexEventListener;
 import org.opensearch.index.shard.IndexShard;
+import org.opensearch.index.store.systemindex.CryptoSystemIndexDescriptor;
+import org.opensearch.indices.SystemIndexDescriptor;
 import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.plugins.Plugin;
+import org.opensearch.plugins.SystemIndexPlugin;
+import org.opensearch.repositories.RepositoriesService;
+import org.opensearch.script.ScriptService;
+import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.client.Client;
+import org.opensearch.watcher.ResourceWatcherService;
 
 /**
  * A plugin that enables index level encryption and decryption.
  */
-public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, EnginePlugin {
+public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, EnginePlugin, SystemIndexPlugin {
 
     private static final Logger LOGGER = LogManager.getLogger(CryptoDirectoryFactory.class);
 
     // Map to track running background threads per index UUID
     private final ConcurrentHashMap<String, Thread> backgroundThreads = new ConcurrentHashMap<>();
+
+    // Dependencies injected via createComponents
+    private Client client;
 
     /**
      * The default constructor.
@@ -50,6 +69,7 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
         return Arrays
             .asList(
                 CryptoDirectoryFactory.INDEX_KMS_TYPE_SETTING,
+                CryptoDirectoryFactory.INDEX_KMS_KEY_ID_SETTING,
                 CryptoDirectoryFactory.INDEX_CRYPTO_PROVIDER_SETTING,
                 CryptoDirectoryFactory.KMS_DATA_KEY_TTL_SECONDS_SETTING
             );
@@ -59,22 +79,58 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
      * {@inheritDoc}
      */
     @Override
+    public Collection<Object> createComponents(
+        Client client,
+        ClusterService clusterService,
+        ThreadPool threadPool,
+        ResourceWatcherService resourceWatcherService,
+        ScriptService scriptService,
+        NamedXContentRegistry xContentRegistry,
+        Environment environment,
+        NodeEnvironment nodeEnvironment,
+        NamedWriteableRegistry namedWriteableRegistry,
+        IndexNameExpressionResolver indexNameExpressionResolver,
+        Supplier<RepositoriesService> repositoriesServiceSupplier
+    ) {
+        this.client = client;
+
+        // No additional components needed - SystemIndexKeyIvResolver will handle system index creation
+        return Collections.emptyList();
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
     public Map<String, DirectoryFactory> getDirectoryFactories() {
-        return Collections.singletonMap("cryptofs", new CryptoDirectoryFactory());
+        return Collections.singletonMap("cryptofs", new CryptoDirectoryFactory(client));
     }
 
     @Override
     public void onIndexModule(IndexModule indexModule) {
-        LOGGER.info("!!!!! testing that onIndexModule triggered for index: {} !!!!!", indexModule.getIndex().getName());
+        LOGGER.info("CryptoDirectoryPlugin triggered for index: {}", indexModule.getIndex().getName());
 
-        // Add index event listener to handle shard lifecycle events
+        // Only handle cryptofs indices - check if this index uses cryptofs store type
+        Settings indexSettings = indexModule.getSettings();
+        String storeType = indexSettings.get(IndexModule.INDEX_STORE_TYPE_SETTING.getKey());
+        if (!"cryptofs".equals(storeType)) {
+            return;
+        }
+
+        // Add index event listener to handle crypto lifecycle events
         indexModule.addIndexEventListener(new IndexEventListener() {
             @Override
             public void afterIndexShardCreated(IndexShard indexShard) {
-                // Only start thread for primary shard 0 to ensure one per index across cluster
                 ShardId shardId = indexShard.shardId();
+
+                // Only handle primary shard 0 to ensure one operation per index across cluster
                 if (shardId.getId() == 0 && indexShard.routingEntry().primary()) {
-                    LOGGER.info("Starting background thread for primary shard 0 of index: {}", shardId.getIndexName());
+                    LOGGER.info("Initializing crypto for primary shard 0 of index: {}", shardId.getIndexName());
+
+                    // Note: System index creation and key management is handled lazily by SystemIndexKeyIvResolver
+                    // when the first encryption operation occurs
+
+                    // Start background monitoring thread for this index
                     startBackgroundThread(indexShard.indexSettings().getIndex());
                 }
             }
@@ -83,7 +139,7 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
             public void beforeIndexShardClosed(ShardId shardId, IndexShard indexShard, Settings indexSettings) {
                 // Clean up when primary shard 0 is closed
                 if (shardId.getId() == 0 && indexShard != null && indexShard.routingEntry().primary()) {
-                    LOGGER.info("Stopping background thread for primary shard 0 of index: {}", shardId.getIndexName());
+                    LOGGER.info("Cleaning up crypto resources for primary shard 0 of index: {}", shardId.getIndexName());
                     stopBackgroundThread(shardId.getIndex());
                 }
             }
@@ -144,8 +200,16 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
     public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings) {
         // Only provide our custom engine factory for cryptofs indices
         if ("cryptofs".equals(indexSettings.getValue(IndexModule.INDEX_STORE_TYPE_SETTING))) {
-            return Optional.of(new CryptoEngineFactory());
+            return Optional.of(new CryptoEngineFactory(client));
         }
         return Optional.empty();
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public Collection<SystemIndexDescriptor> getSystemIndexDescriptors(Settings settings) {
+        return Collections.singletonList(CryptoSystemIndexDescriptor.getDescriptor());
     }
 }

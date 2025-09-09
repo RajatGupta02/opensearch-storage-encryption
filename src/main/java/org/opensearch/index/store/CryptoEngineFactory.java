@@ -5,34 +5,37 @@
 package org.opensearch.index.store;
 
 import java.io.IOException;
-import java.nio.file.Path;
 import java.security.Provider;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.FSDirectory;
 import org.opensearch.common.crypto.MasterKeyProvider;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.engine.InternalEngine;
-import org.opensearch.index.store.iv.IndexKeyResolverRegistry;
 import org.opensearch.index.store.iv.KeyIvResolver;
+import org.opensearch.index.store.iv.SystemIndexKeyIvResolver;
 import org.opensearch.index.translog.CryptoTranslogFactory;
+import org.opensearch.transport.client.Client;
 
 /**
  * A factory that creates engines with crypto-enabled translogs for cryptofs indices.
+ * Uses system index-based key storage for translog encryption.
  */
 public class CryptoEngineFactory implements EngineFactory {
 
     private static final Logger logger = LogManager.getLogger(CryptoEngineFactory.class);
 
+    private final Client client;
+
     /**
-     * Constructor for index-level encryption.
+     * Constructor for system index-based encryption.
+     * 
+     * @param client the OpenSearch client for system index operations
      */
-    public CryptoEngineFactory() {
-        // No dependencies needed for index-level encryption
+    public CryptoEngineFactory(Client client) {
+        this.client = client;
     }
 
     /**
@@ -63,25 +66,18 @@ public class CryptoEngineFactory implements EngineFactory {
     }
 
     /**
-     * Create a KeyIvResolver for translog encryption using shared index-level keys.
-     * This uses the same resolver registry as CryptoDirectoryFactory to prevent race conditions.
+     * Create a KeyIvResolver for translog encryption using the same system index approach
+     * as CryptoDirectoryFactory. This ensures both directory and translog use the same keys.
      */
     private KeyIvResolver createTranslogKeyIvResolver(EngineConfig config) throws IOException {
-        // Use index-level keys for translog encryption - same as directory encryption
-        Path translogPath = config.getTranslogConfig().getTranslogPath();
-        Path indexDirectory = translogPath.getParent().getParent(); // Go up two levels: translog -> shard -> index
-
         // Get the same settings that CryptoDirectoryFactory uses
         Provider provider = config.getIndexSettings().getValue(CryptoDirectoryFactory.INDEX_CRYPTO_PROVIDER_SETTING);
         MasterKeyProvider keyProvider = getKeyProvider(config);
-
-        // Create directory for index-level keys (same as CryptoDirectoryFactory)
-        Directory indexKeyDirectory = FSDirectory.open(indexDirectory);
-
-        // Use shared resolver registry to get the SAME resolver instance as CryptoDirectoryFactory
         String indexUuid = config.getIndexSettings().getIndex().getUUID();
-        return IndexKeyResolverRegistry
-            .getOrCreateResolver(indexUuid, indexKeyDirectory, provider, keyProvider, config.getIndexSettings().getSettings());
+        String kmsKeyId = config.getIndexSettings().getValue(CryptoDirectoryFactory.INDEX_KMS_KEY_ID_SETTING);
+
+        // Use system index-based key storage - same as CryptoDirectoryFactory
+        return new SystemIndexKeyIvResolver(client, indexUuid, kmsKeyId, provider, keyProvider, config.getIndexSettings().getSettings());
     }
 
     /**
@@ -89,7 +85,7 @@ public class CryptoEngineFactory implements EngineFactory {
      */
     private MasterKeyProvider getKeyProvider(EngineConfig config) {
         // Reuse the same logic as CryptoDirectoryFactory
-        return new CryptoDirectoryFactory().getKeyProvider(config.getIndexSettings());
+        return new CryptoDirectoryFactory(client).getKeyProvider(config.getIndexSettings());
     }
 
 }

@@ -16,7 +16,6 @@ import java.util.function.Function;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.LockFactory;
 import org.opensearch.cluster.metadata.CryptoMetadata;
 import org.opensearch.common.SuppressForbidden;
@@ -30,12 +29,13 @@ import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.index.store.hybrid.HybridCryptoDirectory;
-import org.opensearch.index.store.iv.IndexKeyResolverRegistry;
 import org.opensearch.index.store.iv.KeyIvResolver;
+import org.opensearch.index.store.iv.SystemIndexKeyIvResolver;
 import org.opensearch.index.store.mmap.EagerDecryptedCryptoMMapDirectory;
 import org.opensearch.index.store.mmap.LazyDecryptedCryptoMMapDirectory;
 import org.opensearch.index.store.niofs.CryptoNIOFSDirectory;
 import org.opensearch.plugins.IndexStorePlugin;
+import org.opensearch.transport.client.Client;
 
 @SuppressForbidden(reason = "temporary")
 /**
@@ -45,11 +45,13 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
 
     private static final Logger LOGGER = LogManager.getLogger(CryptoDirectoryFactory.class);
 
+    private final Client client;
+
     /**
-     * Creates a new CryptoDirectoryFactory for index-level encryption
+     * Creates a new CryptoDirectoryFactory with system index-based key storage
      */
-    public CryptoDirectoryFactory() {
-        super();
+    public CryptoDirectoryFactory(Client client) {
+        this.client = client;
     }
 
     /**
@@ -71,6 +73,15 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
             throw new SettingsException("index.store.kms.type must be set");
         }
     }, Property.NodeScope, Property.IndexScope);
+
+    /**
+     * Specifies the KMS key ID/ARN to use for encrypting data keys for this index.
+     */
+    public static final Setting<String> INDEX_KMS_KEY_ID_SETTING = new Setting<>("index.store.kms.key_id", "", Function.identity(), (s) -> {
+        if (s == null || s.isEmpty()) {
+            throw new SettingsException("index.store.kms.key_id must be set");
+        }
+    }, Property.IndexScope);
 
     /**
      * Specifies the TTL for data keys in seconds before they are refreshed from KMS. Default is 300 seconds (5 minutes).
@@ -118,18 +129,20 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
     protected Directory newFSDirectory(Path location, LockFactory lockFactory, IndexSettings indexSettings) throws IOException {
         final Provider provider = indexSettings.getValue(INDEX_CRYPTO_PROVIDER_SETTING);
 
-        // Use index-level key resolver - store keys at index level
-
-        Path indexDirectory = location.getParent().getParent(); // Go up two levels: index -> shard -> index
         MasterKeyProvider keyProvider = getKeyProvider(indexSettings);
-
-        // Create a directory for the index-level keys
-        Directory indexKeyDirectory = FSDirectory.open(indexDirectory);
-
-        // Use shared resolver registry to prevent race conditions
         String indexUuid = indexSettings.getIndex().getUUID();
-        KeyIvResolver keyIvResolver = IndexKeyResolverRegistry
-            .getOrCreateResolver(indexUuid, indexKeyDirectory, provider, keyProvider, indexSettings.getSettings());
+
+        // Always use system index-based key storage
+        LOGGER.debug("Using system index-based key storage for index: {}", indexUuid);
+        String kmsKeyId = indexSettings.getValue(INDEX_KMS_KEY_ID_SETTING);
+        KeyIvResolver keyIvResolver = new SystemIndexKeyIvResolver(
+            client,
+            indexUuid,
+            kmsKeyId,
+            provider,
+            keyProvider,
+            indexSettings.getSettings()
+        );
 
         IndexModule.Type type = IndexModule.defaultStoreType(IndexModule.NODE_STORE_ALLOW_MMAP.get(indexSettings.getNodeSettings()));
         Set<String> preLoadExtensions = new HashSet<>(indexSettings.getValue(IndexModule.INDEX_STORE_PRE_LOAD_SETTING));
