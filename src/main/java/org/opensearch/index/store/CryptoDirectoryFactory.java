@@ -36,6 +36,7 @@ import org.opensearch.index.store.iv.SystemIndexKeyIvResolver;
 import org.opensearch.index.store.mmap.EagerDecryptedCryptoMMapDirectory;
 import org.opensearch.index.store.mmap.LazyDecryptedCryptoMMapDirectory;
 import org.opensearch.index.store.niofs.CryptoNIOFSDirectory;
+import org.opensearch.index.store.systemindex.SystemIndexManager;
 import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.transport.client.Client;
 
@@ -48,14 +49,18 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
     private static final Logger LOGGER = LogManager.getLogger(CryptoDirectoryFactory.class);
 
     private final Supplier<Client> clientSupplier;
+    private final Supplier<SystemIndexManager> systemIndexManagerSupplier;
 
     /**
-     * Creates a new CryptoDirectoryFactory with lazy client resolution.
+     * Creates a new CryptoDirectoryFactory with lazy client and system index manager resolution.
      * 
      * @param clientSupplier supplier that provides the client when needed
+     * @param systemIndexManagerSupplier supplier that provides the system index manager when needed
      */
-    public CryptoDirectoryFactory(Supplier<Client> clientSupplier) {
+    public CryptoDirectoryFactory(Supplier<Client> clientSupplier, Supplier<SystemIndexManager> systemIndexManagerSupplier) {
         this.clientSupplier = Objects.requireNonNull(clientSupplier, "Client supplier cannot be null");
+        this.systemIndexManagerSupplier = Objects
+            .requireNonNull(systemIndexManagerSupplier, "System index manager supplier cannot be null");
     }
 
     /**
@@ -74,6 +79,24 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
             );
         }
         return client;
+    }
+
+    /**
+     * Gets the system index manager with proper error handling for initialization timing issues.
+     * 
+     * @return the SystemIndexManager
+     * @throws IllegalStateException if system index manager is not yet available
+     */
+    private SystemIndexManager getSystemIndexManager() {
+        SystemIndexManager manager = systemIndexManagerSupplier.get();
+        if (manager == null) {
+            throw new IllegalStateException(
+                "SystemIndexManager not available - OpenSearch may still be initializing. "
+                    + "This typically happens during plugin startup. Please ensure the plugin is properly installed "
+                    + "and OpenSearch has completed initialization."
+            );
+        }
+        return manager;
     }
 
     /**
@@ -163,7 +186,8 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
             kmsKeyId,
             provider,
             keyProvider,
-            indexSettings.getSettings()
+            indexSettings.getSettings(),
+            getSystemIndexManager()
         );
 
         IndexModule.Type type = IndexModule.defaultStoreType(IndexModule.NODE_STORE_ALLOW_MMAP.get(indexSettings.getNodeSettings()));

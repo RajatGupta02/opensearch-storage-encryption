@@ -16,12 +16,7 @@ import javax.crypto.spec.SecretKeySpec;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.opensearch.ResourceAlreadyExistsException;
 import org.opensearch.action.DocWriteResponse;
-import org.opensearch.action.admin.indices.create.CreateIndexRequest;
-import org.opensearch.action.admin.indices.create.CreateIndexResponse;
-import org.opensearch.action.admin.indices.exists.indices.IndicesExistsRequest;
-import org.opensearch.action.admin.indices.exists.indices.IndicesExistsResponse;
 import org.opensearch.action.get.GetRequest;
 import org.opensearch.action.get.GetResponse;
 import org.opensearch.action.index.IndexRequest;
@@ -35,6 +30,7 @@ import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.index.store.cipher.AesCipherFactory;
 import org.opensearch.index.store.systemindex.CryptoKeyDocument;
 import org.opensearch.index.store.systemindex.CryptoSystemIndexDescriptor;
+import org.opensearch.index.store.systemindex.SystemIndexManager;
 import org.opensearch.transport.client.Client;
 
 /**
@@ -57,13 +53,14 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
     private final String indexUuid;
     private final String kmsKeyId;
     private final MasterKeyProvider keyProvider;
+    private final SystemIndexManager systemIndexManager;
 
     // In-memory cache - no TTL refresh as requested
     private final ConcurrentHashMap<String, Key> keyCache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, byte[]> ivCache = new ConcurrentHashMap<>();
 
-    // Track if system index has been verified to exist
-    private volatile boolean systemIndexVerified = false;
+    // Timeout for waiting for system index readiness (30 seconds)
+    private static final long SYSTEM_INDEX_READY_TIMEOUT_MS = 30000L;
 
     private static final String ALGORITHM = "AES";
 
@@ -83,6 +80,7 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
      * @param provider the JCE provider (not used in this implementation but kept for interface compatibility)
      * @param keyProvider the master key provider for KMS operations
      * @param settings additional settings (unused but kept for compatibility)
+     * @param systemIndexManager the system index manager for handling system index lifecycle
      * @throws IllegalArgumentException if any required parameter is null or invalid
      */
     public SystemIndexKeyIvResolver(
@@ -91,7 +89,8 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
         String kmsKeyId,
         Provider provider,
         MasterKeyProvider keyProvider,
-        Settings settings
+        Settings settings,
+        SystemIndexManager systemIndexManager
     ) {
         // Validate required parameters
         if (client == null) {
@@ -106,6 +105,9 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
         if (keyProvider == null) {
             throw new IllegalArgumentException("Master key provider cannot be null");
         }
+        if (systemIndexManager == null) {
+            throw new IllegalArgumentException("System index manager cannot be null");
+        }
 
         // Validate KMS key ID format (basic validation)
         if (!isValidKmsKeyId(kmsKeyId)) {
@@ -116,6 +118,7 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
         this.indexUuid = indexUuid.trim();
         this.kmsKeyId = kmsKeyId.trim();
         this.keyProvider = keyProvider;
+        this.systemIndexManager = systemIndexManager;
 
         logger.info("SystemIndexKeyIvResolver initialized for index: {} with KMS key: {}", indexUuid, kmsKeyId);
     }
@@ -323,74 +326,36 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
     }
 
     /**
-     * Ensures the crypto system index exists with proper mappings and settings.
-     * This method is idempotent and thread-safe.
+     * Ensures the crypto system index is ready for operations.
+     * Uses SystemIndexManager to check readiness and handle retries if needed.
      *
-     * @throws IOException if index creation fails
+     * @throws IOException if system index is not ready and cannot be made ready
      */
     private void ensureSystemIndexExists() throws IOException {
-        // Double-checked locking pattern for performance
-        if (!systemIndexVerified) {
-            synchronized (this) {
-                if (!systemIndexVerified) {
-                    createSystemIndexIfNotExists();
-                    systemIndexVerified = true;
-                }
-            }
+        // Check if system index is already ready
+        if (systemIndexManager.isSystemIndexReady()) {
+            logger.debug("System index is ready for operations");
+            return;
         }
-    }
 
-    /**
-     * Creates the system index if it doesn't already exist.
-     * Handles race conditions where multiple threads try to create the same index simultaneously.
-     *
-     * @throws IOException if index operations fail
-     */
-    private void createSystemIndexIfNotExists() throws IOException {
-        try {
-            // Check if index exists
-            IndicesExistsRequest existsRequest = new IndicesExistsRequest(CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME);
-            IndicesExistsResponse existsResponse = client.admin().indices().exists(existsRequest).actionGet();
+        logger.info("System index not ready, waiting for readiness...");
 
-            if (!existsResponse.isExists()) {
-                logger.info("Creating crypto system index: {}", CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME);
-
-                try {
-                    // Use CryptoSystemIndexDescriptor directly for mappings and settings
-                    CreateIndexRequest createRequest = new CreateIndexRequest(CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME)
-                        .settings(CryptoSystemIndexDescriptor.getSystemIndexSettings())
-                        .mapping(CryptoSystemIndexDescriptor.getMappings());
-
-                    CreateIndexResponse createResponse = client.admin().indices().create(createRequest).actionGet();
-
-                    if (createResponse.isAcknowledged()) {
-                        logger.info("Successfully created crypto system index: {}", CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME);
-                    } else {
-                        throw new IOException("Failed to create crypto system index: not acknowledged");
-                    }
-
-                } catch (ResourceAlreadyExistsException e) {
-                    // Race condition: another thread created the index between our check and create attempt
-                    // This is expected behavior in concurrent environments and should be treated as success
-                    logger
-                        .info(
-                            "Crypto system index already exists (created by another thread): {}",
-                            CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME
-                        );
-                }
-            } else {
-                logger.debug("Crypto system index already exists: {}", CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME);
-            }
-        } catch (ResourceAlreadyExistsException e) {
-            // Handle case where the exception wasn't caught in the inner try-catch
-            logger
-                .info(
-                    "Crypto system index already exists (race condition resolved): {}",
-                    CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME
-                );
-        } catch (Exception e) {
-            logger.error("Failed to ensure crypto system index exists", e);
-            throw new IOException("Failed to ensure crypto system index exists", e);
+        // Wait for system index to become ready with timeout
+        if (systemIndexManager.waitForSystemIndexReady(SYSTEM_INDEX_READY_TIMEOUT_MS)) {
+            logger.info("System index became ready for operations");
+            return;
         }
+
+        // If still not ready, try to retry creation
+        logger.warn("System index not ready within timeout, attempting retry...");
+        if (systemIndexManager.retrySystemIndexCreation()) {
+            logger.info("System index creation retry succeeded");
+            return;
+        }
+
+        // Final failure
+        String errorMsg = "System index is not ready and retry failed - cannot perform encryption operations";
+        logger.error(errorMsg);
+        throw new IOException(errorMsg);
     }
 }

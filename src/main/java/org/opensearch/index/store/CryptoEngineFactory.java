@@ -18,6 +18,7 @@ import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.store.iv.KeyIvResolver;
 import org.opensearch.index.store.iv.SystemIndexKeyIvResolver;
+import org.opensearch.index.store.systemindex.SystemIndexManager;
 import org.opensearch.index.translog.CryptoTranslogFactory;
 import org.opensearch.transport.client.Client;
 
@@ -30,14 +31,17 @@ public class CryptoEngineFactory implements EngineFactory {
     private static final Logger logger = LogManager.getLogger(CryptoEngineFactory.class);
 
     private final Supplier<Client> clientSupplier;
+    private final Supplier<SystemIndexManager> systemIndexManagerSupplier;
 
     /**
-     * Constructor for system index-based encryption with lazy client resolution.
+     * Constructor for system index-based encryption with lazy client and SystemIndexManager resolution.
      * 
      * @param clientSupplier supplier that provides the client when needed
+     * @param systemIndexManagerSupplier supplier that provides the SystemIndexManager when needed
      */
-    public CryptoEngineFactory(Supplier<Client> clientSupplier) {
+    public CryptoEngineFactory(Supplier<Client> clientSupplier, Supplier<SystemIndexManager> systemIndexManagerSupplier) {
         this.clientSupplier = Objects.requireNonNull(clientSupplier, "Client supplier cannot be null");
+        this.systemIndexManagerSupplier = Objects.requireNonNull(systemIndexManagerSupplier, "SystemIndexManager supplier cannot be null");
     }
 
     /**
@@ -55,6 +59,23 @@ public class CryptoEngineFactory implements EngineFactory {
             );
         }
         return client;
+    }
+
+    /**
+     * Gets the SystemIndexManager with proper error handling for initialization timing issues.
+     * 
+     * @return the SystemIndexManager
+     * @throws IllegalStateException if SystemIndexManager is not yet available
+     */
+    private SystemIndexManager getSystemIndexManager() {
+        SystemIndexManager manager = systemIndexManagerSupplier.get();
+        if (manager == null) {
+            throw new IllegalStateException(
+                "SystemIndexManager not available for translog encryption - OpenSearch may still be initializing. "
+                    + "This typically happens during plugin startup."
+            );
+        }
+        return manager;
     }
 
     /**
@@ -102,7 +123,8 @@ public class CryptoEngineFactory implements EngineFactory {
             kmsKeyId,
             provider,
             keyProvider,
-            config.getIndexSettings().getSettings()
+            config.getIndexSettings().getSettings(),
+            getSystemIndexManager()
         );
     }
 
@@ -111,7 +133,7 @@ public class CryptoEngineFactory implements EngineFactory {
      */
     private MasterKeyProvider getKeyProvider(EngineConfig config) {
         // Reuse the same logic as CryptoDirectoryFactory
-        return new CryptoDirectoryFactory(() -> getClient()).getKeyProvider(config.getIndexSettings());
+        return new CryptoDirectoryFactory(() -> getClient(), () -> getSystemIndexManager()).getKeyProvider(config.getIndexSettings());
     }
 
 }

@@ -27,6 +27,7 @@ import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.store.systemindex.CryptoSystemIndexDescriptor;
+import org.opensearch.index.store.systemindex.SystemIndexManager;
 import org.opensearch.indices.SystemIndexDescriptor;
 import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.IndexStorePlugin;
@@ -50,6 +51,7 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
 
     // Dependencies injected via createComponents
     private Client client;
+    private SystemIndexManager systemIndexManager;
 
     /**
      * The default constructor.
@@ -91,8 +93,11 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
     ) {
         this.client = client;
 
-        // No additional components needed - SystemIndexKeyIvResolver will handle system index creation
-        return Collections.emptyList();
+        // Create SystemIndexManager to handle early system index creation
+        this.systemIndexManager = new SystemIndexManager(client);
+
+        // Return SystemIndexManager as a LifecycleComponent for OpenSearch to manage
+        return Arrays.asList(systemIndexManager);
     }
 
     /**
@@ -100,7 +105,7 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
      */
     @Override
     public Map<String, DirectoryFactory> getDirectoryFactories() {
-        return Collections.singletonMap("cryptofs", new CryptoDirectoryFactory(() -> this.client));
+        return Collections.singletonMap("cryptofs", new CryptoDirectoryFactory(() -> this.client, () -> this.systemIndexManager));
     }
 
     // @Override
@@ -197,7 +202,7 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
     public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings) {
         // Only provide our custom engine factory for cryptofs indices
         if ("cryptofs".equals(indexSettings.getValue(IndexModule.INDEX_STORE_TYPE_SETTING))) {
-            return Optional.of(new CryptoEngineFactory(() -> this.client));
+            return Optional.of(new CryptoEngineFactory(() -> this.client, () -> this.systemIndexManager));
         }
         return Optional.empty();
     }
