@@ -60,23 +60,13 @@ public class SystemIndexManager extends AbstractLifecycleComponent {
     /**
      * {@inheritDoc}
      * 
-     * Creates the crypto system index during the start phase of OpenSearch startup.
-     * This ensures the system index is available before any encryption operations begin.
+     * Basic component initialization only. System index creation is deferred until
+     * the cluster is ready via initializeSystemIndex() method called from plugin's onNodeStarted().
      */
     @Override
     protected void doStart() {
-        logger.info("Starting SystemIndexManager - creating crypto system index");
-
-        try {
-            createSystemIndexIfNeeded();
-            systemIndexReady.set(true);
-            logger.info("SystemIndexManager started successfully - crypto system index is ready");
-        } catch (Exception e) {
-            systemIndexReady.set(false);
-            logger.error("Failed to start SystemIndexManager - crypto system index creation failed", e);
-            // Don't throw exception to prevent OpenSearch startup failure
-            // Components will check readiness and handle accordingly
-        }
+        logger.info("Starting SystemIndexManager - deferring system index creation until cluster is ready");
+        // No system index creation here - wait for cluster to be ready
     }
 
     /**
@@ -137,6 +127,27 @@ public class SystemIndexManager extends AbstractLifecycleComponent {
 
         logger.warn("System index did not become ready within {} ms timeout", timeoutMs);
         return false;
+    }
+
+    /**
+     * Initialize the system index when the cluster is ready.
+     * This should be called from the plugin's onNodeStarted() method.
+     * 
+     * @return true if initialization succeeded or index already exists, false otherwise
+     */
+    public boolean initializeSystemIndex() {
+        logger.info("Initializing crypto system index - cluster is ready");
+
+        try {
+            createSystemIndexIfNeeded();
+            systemIndexReady.set(true);
+            logger.info("System index initialization succeeded");
+            return true;
+        } catch (Exception e) {
+            systemIndexReady.set(false);
+            logger.error("System index initialization failed", e);
+            return false;
+        }
     }
 
     /**

@@ -16,6 +16,7 @@ import java.util.function.Supplier;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
@@ -29,6 +30,7 @@ import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.store.systemindex.CryptoSystemIndexDescriptor;
 import org.opensearch.index.store.systemindex.SystemIndexManager;
 import org.opensearch.indices.SystemIndexDescriptor;
+import org.opensearch.plugins.ClusterPlugin;
 import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.plugins.Plugin;
@@ -42,7 +44,7 @@ import org.opensearch.watcher.ResourceWatcherService;
 /**
  * A plugin that enables index level encryption and decryption.
  */
-public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, EnginePlugin, SystemIndexPlugin {
+public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, EnginePlugin, SystemIndexPlugin, ClusterPlugin {
 
     private static final Logger LOGGER = LogManager.getLogger(CryptoDirectoryFactory.class);
 
@@ -213,5 +215,29 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
     @Override
     public Collection<SystemIndexDescriptor> getSystemIndexDescriptors(Settings settings) {
         return Collections.singletonList(CryptoSystemIndexDescriptor.getDescriptor());
+    }
+
+    /**
+     * {@inheritDoc}
+     * 
+     * Called when the node has started and joined the cluster. This is the appropriate
+     * time to create the crypto system index, as the cluster service is now ready.
+     */
+    @Override
+    public void onNodeStarted(DiscoveryNode localNode) {
+        if (systemIndexManager != null) {
+            LOGGER.info("Node started - initializing crypto system index");
+
+            // Initialize system index now that cluster is ready
+            boolean success = systemIndexManager.initializeSystemIndex();
+
+            if (success) {
+                LOGGER.info("Crypto system index initialization completed successfully");
+            } else {
+                LOGGER.warn("Crypto system index initialization failed - encryption operations may fail until index is created");
+            }
+        } else {
+            LOGGER.warn("SystemIndexManager not available during node startup - this should not happen");
+        }
     }
 }
