@@ -10,8 +10,10 @@ import java.nio.file.Path;
 import java.security.Provider;
 import java.security.Security;
 import java.util.HashSet;
+import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -45,13 +47,33 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
 
     private static final Logger LOGGER = LogManager.getLogger(CryptoDirectoryFactory.class);
 
-    private final Client client;
+    private final Supplier<Client> clientSupplier;
 
     /**
-     * Creates a new CryptoDirectoryFactory with system index-based key storage
+     * Creates a new CryptoDirectoryFactory with lazy client resolution.
+     * 
+     * @param clientSupplier supplier that provides the client when needed
      */
-    public CryptoDirectoryFactory(Client client) {
-        this.client = client;
+    public CryptoDirectoryFactory(Supplier<Client> clientSupplier) {
+        this.clientSupplier = Objects.requireNonNull(clientSupplier, "Client supplier cannot be null");
+    }
+
+    /**
+     * Gets the client with proper error handling for initialization timing issues.
+     * 
+     * @return the OpenSearch client
+     * @throws IllegalStateException if client is not yet available
+     */
+    private Client getClient() {
+        Client client = clientSupplier.get();
+        if (client == null) {
+            throw new IllegalStateException(
+                "Client not available - OpenSearch may still be initializing. "
+                    + "This typically happens during plugin startup. Please ensure the plugin is properly installed "
+                    + "and OpenSearch has completed initialization."
+            );
+        }
+        return client;
     }
 
     /**
@@ -136,7 +158,7 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
         LOGGER.debug("Using system index-based key storage for index: {}", indexUuid);
         String kmsKeyId = indexSettings.getValue(INDEX_KMS_KEY_ID_SETTING);
         KeyIvResolver keyIvResolver = new SystemIndexKeyIvResolver(
-            client,
+            getClient(),
             indexUuid,
             kmsKeyId,
             provider,

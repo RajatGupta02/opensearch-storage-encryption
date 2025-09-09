@@ -20,15 +20,12 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
-import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
 import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
-import org.opensearch.index.shard.IndexEventListener;
-import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.store.systemindex.CryptoSystemIndexDescriptor;
 import org.opensearch.indices.SystemIndexDescriptor;
 import org.opensearch.plugins.EnginePlugin;
@@ -103,48 +100,48 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
      */
     @Override
     public Map<String, DirectoryFactory> getDirectoryFactories() {
-        return Collections.singletonMap("cryptofs", new CryptoDirectoryFactory(client));
+        return Collections.singletonMap("cryptofs", new CryptoDirectoryFactory(() -> this.client));
     }
 
-    @Override
-    public void onIndexModule(IndexModule indexModule) {
-        LOGGER.info("CryptoDirectoryPlugin triggered for index: {}", indexModule.getIndex().getName());
+    // @Override
+    // public void onIndexModule(IndexModule indexModule) {
+    // LOGGER.info("CryptoDirectoryPlugin triggered for index: {}", indexModule.getIndex().getName());
 
-        // Only handle cryptofs indices - check if this index uses cryptofs store type
-        Settings indexSettings = indexModule.getSettings();
-        String storeType = indexSettings.get(IndexModule.INDEX_STORE_TYPE_SETTING.getKey());
-        if (!"cryptofs".equals(storeType)) {
-            return;
-        }
+    // // Only handle cryptofs indices - check if this index uses cryptofs store type
+    // Settings indexSettings = indexModule.getSettings();
+    // String storeType = indexSettings.get(IndexModule.INDEX_STORE_TYPE_SETTING.getKey());
+    // if (!"cryptofs".equals(storeType)) {
+    // return;
+    // }
 
-        // Add index event listener to handle crypto lifecycle events
-        indexModule.addIndexEventListener(new IndexEventListener() {
-            @Override
-            public void afterIndexShardCreated(IndexShard indexShard) {
-                ShardId shardId = indexShard.shardId();
+    // // Add index event listener to handle crypto lifecycle events
+    // indexModule.addIndexEventListener(new IndexEventListener() {
+    // @Override
+    // public void afterIndexShardCreated(IndexShard indexShard) {
+    // ShardId shardId = indexShard.shardId();
 
-                // Only handle primary shard 0 to ensure one operation per index across cluster
-                if (shardId.getId() == 0 && indexShard.routingEntry().primary()) {
-                    LOGGER.info("Initializing crypto for primary shard 0 of index: {}", shardId.getIndexName());
+    // // Only handle primary shard 0 to ensure one operation per index across cluster
+    // if (shardId.getId() == 0 && indexShard.routingEntry().primary()) {
+    // LOGGER.info("Initializing crypto for primary shard 0 of index: {}", shardId.getIndexName());
 
-                    // Note: System index creation and key management is handled lazily by SystemIndexKeyIvResolver
-                    // when the first encryption operation occurs
+    // // Note: System index creation and key management is handled lazily by SystemIndexKeyIvResolver
+    // // when the first encryption operation occurs
 
-                    // Start background monitoring thread for this index
-                    startBackgroundThread(indexShard.indexSettings().getIndex());
-                }
-            }
+    // // Start background monitoring thread for this index
+    // startBackgroundThread(indexShard.indexSettings().getIndex());
+    // }
+    // }
 
-            @Override
-            public void beforeIndexShardClosed(ShardId shardId, IndexShard indexShard, Settings indexSettings) {
-                // Clean up when primary shard 0 is closed
-                if (shardId.getId() == 0 && indexShard != null && indexShard.routingEntry().primary()) {
-                    LOGGER.info("Cleaning up crypto resources for primary shard 0 of index: {}", shardId.getIndexName());
-                    stopBackgroundThread(shardId.getIndex());
-                }
-            }
-        });
-    }
+    // @Override
+    // public void beforeIndexShardClosed(ShardId shardId, IndexShard indexShard, Settings indexSettings) {
+    // // Clean up when primary shard 0 is closed
+    // if (shardId.getId() == 0 && indexShard != null && indexShard.routingEntry().primary()) {
+    // LOGGER.info("Cleaning up crypto resources for primary shard 0 of index: {}", shardId.getIndexName());
+    // stopBackgroundThread(shardId.getIndex());
+    // }
+    // }
+    // });
+    // }
 
     /**
      * Start background thread for the given index that prints "hello world" every 10 seconds
@@ -200,7 +197,7 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
     public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings) {
         // Only provide our custom engine factory for cryptofs indices
         if ("cryptofs".equals(indexSettings.getValue(IndexModule.INDEX_STORE_TYPE_SETTING))) {
-            return Optional.of(new CryptoEngineFactory(client));
+            return Optional.of(new CryptoEngineFactory(() -> this.client));
         }
         return Optional.empty();
     }

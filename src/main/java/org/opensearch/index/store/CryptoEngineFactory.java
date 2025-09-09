@@ -6,6 +6,8 @@ package org.opensearch.index.store;
 
 import java.io.IOException;
 import java.security.Provider;
+import java.util.Objects;
+import java.util.function.Supplier;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -27,15 +29,32 @@ public class CryptoEngineFactory implements EngineFactory {
 
     private static final Logger logger = LogManager.getLogger(CryptoEngineFactory.class);
 
-    private final Client client;
+    private final Supplier<Client> clientSupplier;
 
     /**
-     * Constructor for system index-based encryption.
+     * Constructor for system index-based encryption with lazy client resolution.
      * 
-     * @param client the OpenSearch client for system index operations
+     * @param clientSupplier supplier that provides the client when needed
      */
-    public CryptoEngineFactory(Client client) {
-        this.client = client;
+    public CryptoEngineFactory(Supplier<Client> clientSupplier) {
+        this.clientSupplier = Objects.requireNonNull(clientSupplier, "Client supplier cannot be null");
+    }
+
+    /**
+     * Gets the client with proper error handling for initialization timing issues.
+     * 
+     * @return the OpenSearch client
+     * @throws IllegalStateException if client is not yet available
+     */
+    private Client getClient() {
+        Client client = clientSupplier.get();
+        if (client == null) {
+            throw new IllegalStateException(
+                "Client not available for translog encryption - OpenSearch may still be initializing. "
+                    + "This typically happens during plugin startup."
+            );
+        }
+        return client;
     }
 
     /**
@@ -77,7 +96,14 @@ public class CryptoEngineFactory implements EngineFactory {
         String kmsKeyId = config.getIndexSettings().getValue(CryptoDirectoryFactory.INDEX_KMS_KEY_ID_SETTING);
 
         // Use system index-based key storage - same as CryptoDirectoryFactory
-        return new SystemIndexKeyIvResolver(client, indexUuid, kmsKeyId, provider, keyProvider, config.getIndexSettings().getSettings());
+        return new SystemIndexKeyIvResolver(
+            getClient(),
+            indexUuid,
+            kmsKeyId,
+            provider,
+            keyProvider,
+            config.getIndexSettings().getSettings()
+        );
     }
 
     /**
@@ -85,7 +111,7 @@ public class CryptoEngineFactory implements EngineFactory {
      */
     private MasterKeyProvider getKeyProvider(EngineConfig config) {
         // Reuse the same logic as CryptoDirectoryFactory
-        return new CryptoDirectoryFactory(client).getKeyProvider(config.getIndexSettings());
+        return new CryptoDirectoryFactory(() -> getClient()).getKeyProvider(config.getIndexSettings());
     }
 
 }
