@@ -16,6 +16,7 @@ import javax.crypto.spec.SecretKeySpec;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.ResourceAlreadyExistsException;
 import org.opensearch.action.DocWriteResponse;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.admin.indices.create.CreateIndexResponse;
@@ -341,6 +342,7 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
 
     /**
      * Creates the system index if it doesn't already exist.
+     * Handles race conditions where multiple threads try to create the same index simultaneously.
      *
      * @throws IOException if index operations fail
      */
@@ -353,21 +355,39 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
             if (!existsResponse.isExists()) {
                 logger.info("Creating crypto system index: {}", CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME);
 
-                // Use CryptoSystemIndexDescriptor directly for mappings and settings
-                CreateIndexRequest createRequest = new CreateIndexRequest(CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME)
-                    .settings(CryptoSystemIndexDescriptor.getSystemIndexSettings())
-                    .mapping(CryptoSystemIndexDescriptor.getMappings());
+                try {
+                    // Use CryptoSystemIndexDescriptor directly for mappings and settings
+                    CreateIndexRequest createRequest = new CreateIndexRequest(CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME)
+                        .settings(CryptoSystemIndexDescriptor.getSystemIndexSettings())
+                        .mapping(CryptoSystemIndexDescriptor.getMappings());
 
-                CreateIndexResponse createResponse = client.admin().indices().create(createRequest).actionGet();
+                    CreateIndexResponse createResponse = client.admin().indices().create(createRequest).actionGet();
 
-                if (createResponse.isAcknowledged()) {
-                    logger.info("Successfully created crypto system index: {}", CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME);
-                } else {
-                    throw new IOException("Failed to create crypto system index: not acknowledged");
+                    if (createResponse.isAcknowledged()) {
+                        logger.info("Successfully created crypto system index: {}", CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME);
+                    } else {
+                        throw new IOException("Failed to create crypto system index: not acknowledged");
+                    }
+
+                } catch (ResourceAlreadyExistsException e) {
+                    // Race condition: another thread created the index between our check and create attempt
+                    // This is expected behavior in concurrent environments and should be treated as success
+                    logger
+                        .info(
+                            "Crypto system index already exists (created by another thread): {}",
+                            CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME
+                        );
                 }
             } else {
                 logger.debug("Crypto system index already exists: {}", CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME);
             }
+        } catch (ResourceAlreadyExistsException e) {
+            // Handle case where the exception wasn't caught in the inner try-catch
+            logger
+                .info(
+                    "Crypto system index already exists (race condition resolved): {}",
+                    CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME
+                );
         } catch (Exception e) {
             logger.error("Failed to ensure crypto system index exists", e);
             throw new IOException("Failed to ensure crypto system index exists", e);
