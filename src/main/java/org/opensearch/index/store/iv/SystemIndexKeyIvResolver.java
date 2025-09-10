@@ -9,7 +9,8 @@ import java.security.Key;
 import java.security.Provider;
 import java.security.SecureRandom;
 import java.util.Base64;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 
 import javax.crypto.spec.SecretKeySpec;
@@ -52,6 +53,9 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
 
     private static final Logger logger = LogManager.getLogger(SystemIndexKeyIvResolver.class);
 
+    // Static instance counter for tracking resolver creation
+    private static final AtomicLong instanceCounter = new AtomicLong();
+
     private final Client client;
     private final String indexUuid;
     private final String kmsKeyId;
@@ -59,9 +63,12 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
     private final SystemIndexManager systemIndexManager;
     private final ClusterService clusterService;
 
-    // In-memory cache - no TTL refresh as requested
-    private final ConcurrentHashMap<String, Key> keyCache = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, byte[]> ivCache = new ConcurrentHashMap<>();
+    // Instance ID for debugging and tracking
+    private final long instanceId;
+
+    // Thread-safe data key management like DefaultKeyIvResolver
+    private final AtomicReference<Key> dataKeyRef = new AtomicReference<>();
+    private volatile String ivString;
 
     // Timeout for waiting for system index readiness (30 seconds)
     private static final long SYSTEM_INDEX_READY_TIMEOUT_MS = 30000L;
@@ -129,8 +136,16 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
         this.keyProvider = keyProvider;
         this.systemIndexManager = systemIndexManager;
         this.clusterService = clusterService;
+        this.instanceId = instanceCounter.incrementAndGet();
 
-        logger.info("SystemIndexKeyIvResolver initialized for index: {} with KMS key: {}", indexUuid, kmsKeyId);
+        logger
+            .info(
+                "RESOLVER_INSTANCE: Created resolver instance {} for index: {} with KMS key: {} on thread: {}",
+                instanceId,
+                indexUuid,
+                kmsKeyId,
+                Thread.currentThread().getName()
+            );
     }
 
     /**
@@ -144,25 +159,30 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
 
     /**
      * {@inheritDoc}
-     * Returns the cached data key or fetches it from the system index.
-     * Component type is ignored in this implementation since we don't have TTL refresh logic.
+     * Simple pattern like DefaultKeyIvResolver - load once and cache in atomic reference.
      */
     @Override
     public Key getDataKey(ComponentType componentType) {
-        // Check cache first
-        Key cachedKey = keyCache.get(indexUuid);
-        if (cachedKey != null) {
-            logger.debug("Returning cached data key for index: {}", indexUuid);
-            return cachedKey;
+        Key current = dataKeyRef.get();
+
+        // Load if not available - simple double-checked locking
+        if (current == null) {
+            synchronized (this) {
+                current = dataKeyRef.get();
+                if (current == null) {
+                    try {
+                        fetchOrCreateDataKey();
+                        current = dataKeyRef.get();
+                    } catch (Exception e) {
+                        logger.error("RESOLVER_OP: Instance {} failed to fetch/create data key for index: {}", instanceId, indexUuid, e);
+                        throw new RuntimeException("Failed to retrieve data key from system index", e);
+                    }
+                }
+            }
         }
 
-        // Fetch from system index synchronously
-        try {
-            return fetchOrCreateDataKey();
-        } catch (Exception e) {
-            logger.error("Failed to fetch or create data key for index: {}", indexUuid, e);
-            throw new RuntimeException("Failed to retrieve data key from system index", e);
-        }
+        logger.debug("RESOLVER_OP: Instance {} returning data key for index: {}", instanceId, indexUuid);
+        return current;
     }
 
     /**
@@ -170,32 +190,39 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
      */
     @Override
     public byte[] getIvBytes() {
-        // Check cache first
-        byte[] cachedIv = ivCache.get(indexUuid);
-        if (cachedIv != null) {
-            logger.debug("Returning cached IV for index: {}", indexUuid);
-            return cachedIv;
+        // Load if not available - simple pattern like DefaultKeyIvResolver
+        if (ivString == null) {
+            synchronized (this) {
+                if (ivString == null) {
+                    try {
+                        fetchOrCreateDataKey(); // This will populate both key and IV
+                    } catch (Exception e) {
+                        logger.error("RESOLVER_OP: Instance {} failed to fetch/create IV for index: {}", instanceId, indexUuid, e);
+                        throw new RuntimeException("Failed to retrieve IV from system index", e);
+                    }
+                }
+            }
         }
 
-        // Fetch from system index synchronously
-        try {
-            fetchOrCreateDataKey(); // This will populate both key and IV caches
-            return ivCache.get(indexUuid);
-        } catch (Exception e) {
-            logger.error("Failed to fetch or create IV for index: {}", indexUuid, e);
-            throw new RuntimeException("Failed to retrieve IV from system index", e);
-        }
+        logger.debug("RESOLVER_OP: Instance {} returning IV for index: {}", instanceId, indexUuid);
+        return Base64.getDecoder().decode(ivString);
     }
 
     /**
      * Fetches the crypto key document from system index or creates a new one if not found.
      * Uses single-writer pattern: only the primary node creates keys, others wait and read.
+     * Simple synchronization like DefaultKeyIvResolver.
      * 
-     * @return the decrypted data key
      * @throws IOException if system index operations fail
      */
-    private Key fetchOrCreateDataKey() throws IOException {
-        logger.debug("Fetching crypto key document for index: {}", indexUuid);
+    private void fetchOrCreateDataKey() throws IOException {
+        logger
+            .debug(
+                "RESOLVER_OP: Instance {} fetching crypto key for index: {} on thread: {}",
+                instanceId,
+                indexUuid,
+                Thread.currentThread().getName()
+            );
 
         // Ensure system index exists before any operations
         ensureSystemIndexExists();
@@ -205,30 +232,31 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
 
         if (getResponse.isExists()) {
             // Document exists - parse it (ALL nodes do this)
-            return parseAndCacheExistingKey(getResponse);
+            logger.debug("RESOLVER_OP: Instance {} parsing existing key document for index: {}", instanceId, indexUuid);
+            parseAndSetExistingKey(getResponse);
         } else {
             // Document doesn't exist
             if (isPrimaryNodeForSystemIndex()) {
                 // I'm primary - create the key
-                logger.info("Primary node creating crypto key for index: {}", indexUuid);
-                return createAndStoreNewKey();
+                logger.info("RESOLVER_OP: Instance {} (PRIMARY) creating crypto key for index: {}", instanceId, indexUuid);
+                createAndStoreNewKey();
             } else {
                 // I'm not primary - wait for primary to create it, then read
-                logger.info("Non-primary node waiting for crypto key creation: {}", indexUuid);
-                return waitForKeyCreationAndRead();
+                logger.info("RESOLVER_OP: Instance {} (NON-PRIMARY) waiting for crypto key creation: {}", instanceId, indexUuid);
+                waitForKeyCreationAndRead();
             }
         }
     }
 
     /**
-     * Parses and caches an existing crypto key document.
+     * Parses and sets an existing crypto key document.
+     * Simple pattern like DefaultKeyIvResolver - just set the local variables.
      * 
      * @param getResponse the response containing the existing document
-     * @return the decrypted data key
      * @throws IOException if parsing fails
      */
-    private Key parseAndCacheExistingKey(GetResponse getResponse) throws IOException {
-        logger.debug("Found existing crypto key document for index: {}", indexUuid);
+    private void parseAndSetExistingKey(GetResponse getResponse) throws IOException {
+        logger.debug("RESOLVER_OP: Instance {} found existing crypto key document for index: {}", instanceId, indexUuid);
 
         CryptoKeyDocument document = CryptoKeyDocument.fromSourceMap(getResponse.getSourceAsMap());
 
@@ -237,22 +265,19 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
         byte[] decryptedKeyBytes = keyProvider.decryptKey(encryptedKeyBytes);
         Key dataKey = new SecretKeySpec(decryptedKeyBytes, ALGORITHM);
 
-        // Decode IV
-        byte[] ivBytes = Base64.getDecoder().decode(document.getIv());
-
-        // Cache both key and IV
-        keyCache.put(indexUuid, dataKey);
-        ivCache.put(indexUuid, ivBytes);
+        // Set both key and IV - simple assignment like DefaultKeyIvResolver
+        dataKeyRef.set(dataKey);
+        ivString = document.getIv();
 
         // Log key/IV loading for debugging
         logger
             .info(
-                "Successfully loaded and cached crypto key for index: {} - Key hash: {}, IV hash: {}",
+                "RESOLVER_OP: Instance {} successfully loaded crypto key for index: {} - Key hash: {}, IV hash: {}",
+                instanceId,
                 indexUuid,
                 java.util.Arrays.hashCode(decryptedKeyBytes),
-                java.util.Arrays.hashCode(ivBytes)
+                java.util.Arrays.hashCode(Base64.getDecoder().decode(document.getIv()))
             );
-        return dataKey;
     }
 
     /**
@@ -293,12 +318,11 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
 
     /**
      * Waits for the primary node to create the crypto key, then reads it.
-     * Simple retry logic with exponential backoff.
+     * Simple retry logic with exponential backoff like DefaultKeyIvResolver.
      * 
-     * @return the decrypted data key created by the primary node
      * @throws IOException if timeout or other failure occurs
      */
-    private Key waitForKeyCreationAndRead() throws IOException {
+    private void waitForKeyCreationAndRead() throws IOException {
         int maxRetries = 10;
         int delayMs = 200; // Start with 200ms
 
@@ -310,14 +334,22 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
 
                 GetResponse retryResponse = client.get(getRequest).actionGet();
                 if (retryResponse.isExists()) {
-                    logger.info("Found crypto key created by primary node after {} attempts", attempt);
-                    return parseAndCacheExistingKey(retryResponse);
+                    logger.info("RESOLVER_OP: Instance {} found crypto key created by primary node after {} attempts", instanceId, attempt);
+                    parseAndSetExistingKey(retryResponse);
+                    return;
                 }
 
                 // Exponential backoff with jitter
                 delayMs = Math.min(delayMs * 2, 5000); // Max 5 seconds
 
-                logger.debug("Crypto key not yet created by primary, attempt {}/{}, retrying in {}ms", attempt, maxRetries, delayMs);
+                logger
+                    .debug(
+                        "RESOLVER_OP: Instance {} crypto key not yet created by primary, attempt {}/{}, retrying in {}ms",
+                        instanceId,
+                        attempt,
+                        maxRetries,
+                        delayMs
+                    );
 
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -331,11 +363,11 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
     /**
      * Creates a new data key, encrypts it with KMS, and stores it in the system index.
      * Simplified version for single-writer pattern - only the primary node calls this method.
+     * Simple pattern like DefaultKeyIvResolver - just set the local variables.
      *
-     * @return the new decrypted data key
      * @throws IOException if key creation or storage fails
      */
-    private Key createAndStoreNewKey() throws IOException {
+    private void createAndStoreNewKey() throws IOException {
         try {
             // Generate new data key pair using KMS
             DataKeyPair dataKeyPair = keyProvider.generateDataPair();
@@ -347,10 +379,14 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
             SecureRandom random = Randomness.createSecure();
             random.nextBytes(ivBytes);
 
+            // Create Base64 encoded IV string
+            String ivBase64 = Base64.getEncoder().encodeToString(ivBytes);
+
             // Log key/IV creation for debugging
             logger
                 .info(
-                    "Primary node creating new crypto key for index: {} - Key hash: {}, IV hash: {}",
+                    "RESOLVER_OP: Instance {} (PRIMARY) creating new crypto key for index: {} - Key hash: {}, IV hash: {}",
+                    instanceId,
                     indexUuid,
                     java.util.Arrays.hashCode(decryptedKeyBytes),
                     java.util.Arrays.hashCode(ivBytes)
@@ -361,7 +397,7 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
                 indexUuid,
                 kmsKeyId,
                 Base64.getEncoder().encodeToString(encryptedKeyBytes),
-                Base64.getEncoder().encodeToString(ivBytes),
+                ivBase64,
                 ALGORITHM
             );
 
@@ -379,30 +415,35 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
             if (indexResponse.getResult() == DocWriteResponse.Result.CREATED
                 || indexResponse.getResult() == DocWriteResponse.Result.UPDATED) {
 
-                // Success - cache and return our key
+                // Success - set local variables like DefaultKeyIvResolver
                 Key dataKey = new SecretKeySpec(decryptedKeyBytes, ALGORITHM);
-                keyCache.put(indexUuid, dataKey);
-                ivCache.put(indexUuid, ivBytes);
+                dataKeyRef.set(dataKey);
+                ivString = ivBase64;
 
-                logger.info("Successfully created and stored new crypto key for index: {} in system index", indexUuid);
-                return dataKey;
+                logger
+                    .info(
+                        "RESOLVER_OP: Instance {} successfully created and stored new crypto key for index: {} in system index",
+                        instanceId,
+                        indexUuid
+                    );
             } else {
                 throw new IOException("Unexpected index response: " + indexResponse.getResult());
             }
 
         } catch (Exception e) {
-            logger.error("Failed to create and store new crypto key for index: {}", indexUuid, e);
+            logger.error("RESOLVER_OP: Instance {} failed to create and store new crypto key for index: {}", instanceId, indexUuid, e);
             throw new IOException("Failed to create new crypto key", e);
         }
     }
 
     /**
      * Clears the cache for this resolver (useful for testing).
+     * Simple pattern like DefaultKeyIvResolver - just reset the local variables.
      */
     public void clearCache() {
-        keyCache.remove(indexUuid);
-        ivCache.remove(indexUuid);
-        logger.debug("Cleared cache for index: {}", indexUuid);
+        dataKeyRef.set(null);
+        ivString = null;
+        logger.debug("RESOLVER_OP: Instance {} cleared cache for index: {}", instanceId, indexUuid);
     }
 
     /**

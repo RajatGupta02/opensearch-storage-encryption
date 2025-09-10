@@ -56,6 +56,9 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
     // Shared resolver cache to ensure consistent keys/IVs across directory and engine operations
     private final ConcurrentHashMap<String, KeyIvResolver> resolverCache = new ConcurrentHashMap<>();
 
+    // Synchronization lock for resolver creation to prevent race conditions
+    private final Object resolverCreationLock = new Object();
+
     // Dependencies injected via createComponents
     private Client client;
     private SystemIndexManager systemIndexManager;
@@ -236,17 +239,29 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
     public KeyIvResolver getOrCreateSharedResolver(IndexSettings indexSettings) {
         String indexUuid = indexSettings.getIndex().getUUID();
 
-        // Return existing resolver if cached
+        // First check cache without locking for performance (double-checked locking pattern)
         KeyIvResolver existingResolver = resolverCache.get(indexUuid);
         if (existingResolver != null) {
             LOGGER.debug("Returning cached resolver for index: {}", indexUuid);
             return existingResolver;
         }
 
-        // Create new resolver with thread-safe cache operation
-        KeyIvResolver newResolver = resolverCache.computeIfAbsent(indexUuid, uuid -> {
+        // Use explicit synchronization to prevent concurrent resolver creation
+        synchronized (resolverCreationLock) {
+            // Check cache again after acquiring lock (second check in double-checked locking)
+            existingResolver = resolverCache.get(indexUuid);
+            if (existingResolver != null) {
+                LOGGER.debug("Resolver found in cache after lock acquisition for index: {}", indexUuid);
+                return existingResolver;
+            }
+
             try {
-                LOGGER.info("Creating new shared resolver for index: {}", uuid);
+                LOGGER
+                    .info(
+                        "RESOLVER_CREATION: Creating new resolver for index: {} on thread: {}",
+                        indexUuid,
+                        Thread.currentThread().getName()
+                    );
 
                 // Get the same settings that both factories use
                 java.security.Provider provider = indexSettings.getValue(CryptoDirectoryFactory.INDEX_CRYPTO_PROVIDER_SETTING);
@@ -271,9 +286,10 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
                     throw new RuntimeException("could not find key provider: " + keyProviderType, npe);
                 }
 
-                return new SystemIndexKeyIvResolver(
+                // Create the resolver instance
+                KeyIvResolver newResolver = new SystemIndexKeyIvResolver(
                     getClient(),
-                    uuid,
+                    indexUuid,
                     kmsKeyId,
                     provider,
                     keyProvider,
@@ -281,14 +297,22 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
                     getSystemIndexManager(),
                     getClusterService()
                 );
-            } catch (Exception e) {
-                LOGGER.error("Failed to create shared resolver for index: {}", uuid, e);
-                throw new RuntimeException("Failed to create shared KeyIvResolver", e);
-            }
-        });
 
-        LOGGER.info("Using shared resolver for index: {} (cache size: {})", indexUuid, resolverCache.size());
-        return newResolver;
+                // Put in cache and return
+                resolverCache.put(indexUuid, newResolver);
+                LOGGER
+                    .info(
+                        "RESOLVER_CREATION: Successfully created and cached resolver for index: {} (cache size: {})",
+                        indexUuid,
+                        resolverCache.size()
+                    );
+                return newResolver;
+
+            } catch (Exception e) {
+                LOGGER.error("RESOLVER_CREATION: Failed to create resolver for index: {}", indexUuid, e);
+                throw new RuntimeException("Failed to create shared KeyIvResolver for index: " + indexUuid, e);
+            }
+        }
     }
 
     /**
