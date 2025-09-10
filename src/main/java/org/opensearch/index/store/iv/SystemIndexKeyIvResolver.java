@@ -16,19 +16,20 @@ import javax.crypto.spec.SecretKeySpec;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.opensearch.action.DocWriteRequest;
 import org.opensearch.action.DocWriteResponse;
 import org.opensearch.action.get.GetRequest;
 import org.opensearch.action.get.GetResponse;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.index.IndexResponse;
+import org.opensearch.cluster.routing.IndexRoutingTable;
+import org.opensearch.cluster.routing.ShardRouting;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.Randomness;
 import org.opensearch.common.crypto.DataKeyPair;
 import org.opensearch.common.crypto.MasterKeyProvider;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.xcontent.ToXContent;
-import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.index.store.cipher.AesCipherFactory;
 import org.opensearch.index.store.systemindex.CryptoKeyDocument;
 import org.opensearch.index.store.systemindex.CryptoSystemIndexDescriptor;
@@ -56,6 +57,7 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
     private final String kmsKeyId;
     private final MasterKeyProvider keyProvider;
     private final SystemIndexManager systemIndexManager;
+    private final ClusterService clusterService;
 
     // In-memory cache - no TTL refresh as requested
     private final ConcurrentHashMap<String, Key> keyCache = new ConcurrentHashMap<>();
@@ -83,6 +85,7 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
      * @param keyProvider the master key provider for KMS operations
      * @param settings additional settings (unused but kept for compatibility)
      * @param systemIndexManager the system index manager for handling system index lifecycle
+     * @param clusterService the cluster service for primary shard detection
      * @throws IllegalArgumentException if any required parameter is null or invalid
      */
     public SystemIndexKeyIvResolver(
@@ -92,7 +95,8 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
         Provider provider,
         MasterKeyProvider keyProvider,
         Settings settings,
-        SystemIndexManager systemIndexManager
+        SystemIndexManager systemIndexManager,
+        ClusterService clusterService
     ) {
         // Validate required parameters
         if (client == null) {
@@ -110,6 +114,9 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
         if (systemIndexManager == null) {
             throw new IllegalArgumentException("System index manager cannot be null");
         }
+        if (clusterService == null) {
+            throw new IllegalArgumentException("Cluster service cannot be null");
+        }
 
         // Validate KMS key ID format (basic validation)
         if (!isValidKmsKeyId(kmsKeyId)) {
@@ -121,6 +128,7 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
         this.kmsKeyId = kmsKeyId.trim();
         this.keyProvider = keyProvider;
         this.systemIndexManager = systemIndexManager;
+        this.clusterService = clusterService;
 
         logger.info("SystemIndexKeyIvResolver initialized for index: {} with KMS key: {}", indexUuid, kmsKeyId);
     }
@@ -181,8 +189,8 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
 
     /**
      * Fetches the crypto key document from system index or creates a new one if not found.
-     * Caches both the data key and IV for future use.
-     *
+     * Uses single-writer pattern: only the primary node creates keys, others wait and read.
+     * 
      * @return the decrypted data key
      * @throws IOException if system index operations fail
      */
@@ -193,48 +201,136 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
         ensureSystemIndexExists();
 
         GetRequest getRequest = new GetRequest(CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME).id(indexUuid);
-
         GetResponse getResponse = client.get(getRequest).actionGet();
 
         if (getResponse.isExists()) {
-            // Document exists, parse and cache it
-            logger.debug("Found existing crypto key document for index: {}", indexUuid);
-
-            CryptoKeyDocument document = CryptoKeyDocument.fromSourceMap(getResponse.getSourceAsMap());
-
-            // Decrypt the data key using KMS
-            byte[] encryptedKeyBytes = Base64.getDecoder().decode(document.getEncryptedDataKey());
-            byte[] decryptedKeyBytes = keyProvider.decryptKey(encryptedKeyBytes);
-            Key dataKey = new SecretKeySpec(decryptedKeyBytes, ALGORITHM);
-
-            // Decode IV
-            byte[] ivBytes = Base64.getDecoder().decode(document.getIv());
-
-            // Cache both key and IV
-            keyCache.put(indexUuid, dataKey);
-            ivCache.put(indexUuid, ivBytes);
-
-            // Log key/IV loading for debugging
-            logger
-                .info(
-                    "Successfully loaded and cached crypto key for index: {} - Key hash: {}, IV hash: {}",
-                    indexUuid,
-                    java.util.Arrays.hashCode(decryptedKeyBytes),
-                    java.util.Arrays.hashCode(ivBytes)
-                );
-            return dataKey;
-
+            // Document exists - parse it (ALL nodes do this)
+            return parseAndCacheExistingKey(getResponse);
         } else {
-            // Document doesn't exist, create new key
-            logger.info("Creating new crypto key document for index: {}", indexUuid);
-            return createAndStoreNewKey();
+            // Document doesn't exist
+            if (isPrimaryNodeForSystemIndex()) {
+                // I'm primary - create the key
+                logger.info("Primary node creating crypto key for index: {}", indexUuid);
+                return createAndStoreNewKey();
+            } else {
+                // I'm not primary - wait for primary to create it, then read
+                logger.info("Non-primary node waiting for crypto key creation: {}", indexUuid);
+                return waitForKeyCreationAndRead();
+            }
         }
     }
 
     /**
+     * Parses and caches an existing crypto key document.
+     * 
+     * @param getResponse the response containing the existing document
+     * @return the decrypted data key
+     * @throws IOException if parsing fails
+     */
+    private Key parseAndCacheExistingKey(GetResponse getResponse) throws IOException {
+        logger.debug("Found existing crypto key document for index: {}", indexUuid);
+
+        CryptoKeyDocument document = CryptoKeyDocument.fromSourceMap(getResponse.getSourceAsMap());
+
+        // Decrypt the data key using KMS
+        byte[] encryptedKeyBytes = Base64.getDecoder().decode(document.getEncryptedDataKey());
+        byte[] decryptedKeyBytes = keyProvider.decryptKey(encryptedKeyBytes);
+        Key dataKey = new SecretKeySpec(decryptedKeyBytes, ALGORITHM);
+
+        // Decode IV
+        byte[] ivBytes = Base64.getDecoder().decode(document.getIv());
+
+        // Cache both key and IV
+        keyCache.put(indexUuid, dataKey);
+        ivCache.put(indexUuid, ivBytes);
+
+        // Log key/IV loading for debugging
+        logger
+            .info(
+                "Successfully loaded and cached crypto key for index: {} - Key hash: {}, IV hash: {}",
+                indexUuid,
+                java.util.Arrays.hashCode(decryptedKeyBytes),
+                java.util.Arrays.hashCode(ivBytes)
+            );
+        return dataKey;
+    }
+
+    /**
+     * Determines if the current node holds the primary shard for the crypto system index.
+     * 
+     * @return true if this node is the primary, false otherwise
+     */
+    private boolean isPrimaryNodeForSystemIndex() {
+        try {
+            IndexRoutingTable routingTable = clusterService
+                .state()
+                .routingTable()
+                .index(CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME);
+
+            if (routingTable == null) {
+                logger.debug("System index routing not found, assuming non-primary");
+                return false; // Safe default: don't write if uncertain
+            }
+
+            ShardRouting primaryShard = routingTable.shard(0).primaryShard();
+            String localNodeId = clusterService.localNode().getId();
+
+            boolean isPrimary = primaryShard.currentNodeId().equals(localNodeId);
+            logger
+                .debug(
+                    "Primary check for system index: isPrimary={}, localNode={}, primaryNode={}",
+                    isPrimary,
+                    localNodeId,
+                    primaryShard.currentNodeId()
+                );
+
+            return isPrimary;
+        } catch (Exception e) {
+            logger.warn("Failed to determine primary node status, assuming non-primary", e);
+            return false; // Safe default: don't write if uncertain
+        }
+    }
+
+    /**
+     * Waits for the primary node to create the crypto key, then reads it.
+     * Simple retry logic with exponential backoff.
+     * 
+     * @return the decrypted data key created by the primary node
+     * @throws IOException if timeout or other failure occurs
+     */
+    private Key waitForKeyCreationAndRead() throws IOException {
+        int maxRetries = 10;
+        int delayMs = 200; // Start with 200ms
+
+        GetRequest getRequest = new GetRequest(CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME).id(indexUuid);
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                Thread.sleep(delayMs);
+
+                GetResponse retryResponse = client.get(getRequest).actionGet();
+                if (retryResponse.isExists()) {
+                    logger.info("Found crypto key created by primary node after {} attempts", attempt);
+                    return parseAndCacheExistingKey(retryResponse);
+                }
+
+                // Exponential backoff with jitter
+                delayMs = Math.min(delayMs * 2, 5000); // Max 5 seconds
+
+                logger.debug("Crypto key not yet created by primary, attempt {}/{}, retrying in {}ms", attempt, maxRetries, delayMs);
+
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while waiting for crypto key creation", e);
+            }
+        }
+
+        throw new IOException("Timeout waiting for crypto key creation by primary node after " + maxRetries + " attempts");
+    }
+
+    /**
      * Creates a new data key, encrypts it with KMS, and stores it in the system index.
-     * Uses atomic CREATE operation to handle race conditions where multiple threads
-     * try to create keys for the same index simultaneously.
+     * Simplified version for single-writer pattern - only the primary node calls this method.
      *
      * @return the new decrypted data key
      * @throws IOException if key creation or storage fails
@@ -254,7 +350,7 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
             // Log key/IV creation for debugging
             logger
                 .info(
-                    "Creating new crypto key for index: {} - Key hash: {}, IV hash: {}",
+                    "Primary node creating new crypto key for index: {} - Key hash: {}, IV hash: {}",
                     indexUuid,
                     java.util.Arrays.hashCode(decryptedKeyBytes),
                     java.util.Arrays.hashCode(ivBytes)
@@ -269,61 +365,35 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
                 ALGORITHM
             );
 
-            // Store in system index with CREATE-only semantics to handle race conditions
+            // Store in system index - no race conditions since only primary writes
             IndexRequest indexRequest = new IndexRequest(CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME)
                 .id(document.getDocumentId())
                 .source(
                     document.toXContent(org.opensearch.common.xcontent.XContentFactory.jsonBuilder(), ToXContent.EMPTY_PARAMS).toString(),
                     XContentType.JSON
                 )
-                .setRefreshPolicy("wait_for")
-                .opType(DocWriteRequest.OpType.CREATE); // KEY CHANGE: Only create, fail if exists
+                .setRefreshPolicy("wait_for");
 
-            try {
-                IndexResponse indexResponse = client.index(indexRequest).actionGet();
+            IndexResponse indexResponse = client.index(indexRequest).actionGet();
 
-                if (indexResponse.getResult() == DocWriteResponse.Result.CREATED) {
-                    // Success - we won the race, cache and return our key
-                    Key dataKey = new SecretKeySpec(decryptedKeyBytes, ALGORITHM);
-                    keyCache.put(indexUuid, dataKey);
-                    ivCache.put(indexUuid, ivBytes);
+            if (indexResponse.getResult() == DocWriteResponse.Result.CREATED
+                || indexResponse.getResult() == DocWriteResponse.Result.UPDATED) {
 
-                    logger.info("Successfully created and stored new crypto key for index: {} in system index", indexUuid);
-                    return dataKey;
-                } else {
-                    throw new IOException("Unexpected index response: " + indexResponse.getResult());
-                }
+                // Success - cache and return our key
+                Key dataKey = new SecretKeySpec(decryptedKeyBytes, ALGORITHM);
+                keyCache.put(indexUuid, dataKey);
+                ivCache.put(indexUuid, ivBytes);
 
-            } catch (VersionConflictEngineException e) {
-                // Document was created by another thread - fetch the existing one
-                logger.info("Crypto key document already exists for index: {}, fetching existing key", indexUuid);
-                return fetchExistingKey();
+                logger.info("Successfully created and stored new crypto key for index: {} in system index", indexUuid);
+                return dataKey;
+            } else {
+                throw new IOException("Unexpected index response: " + indexResponse.getResult());
             }
 
-        } catch (VersionConflictEngineException e) {
-            // Handle race condition - another thread created the document first
-            logger.info("Race condition detected for index: {}, fetching existing key", indexUuid);
-            return fetchExistingKey();
         } catch (Exception e) {
             logger.error("Failed to create and store new crypto key for index: {}", indexUuid, e);
             throw new IOException("Failed to create new crypto key", e);
         }
-    }
-
-    /**
-     * Fetches an existing key from the system index when creation fails due to race condition.
-     * Clears cache first to ensure fresh read of the winning thread's key/IV.
-     *
-     * @return the existing decrypted data key
-     * @throws IOException if fetching fails
-     */
-    private Key fetchExistingKey() throws IOException {
-        // Clear cache first to force fresh read from system index
-        keyCache.remove(indexUuid);
-        ivCache.remove(indexUuid);
-
-        // Retry the original fetch logic - this will read the document created by the winning thread
-        return fetchOrCreateDataKey();
     }
 
     /**

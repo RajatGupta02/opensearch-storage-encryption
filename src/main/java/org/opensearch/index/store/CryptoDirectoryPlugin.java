@@ -59,6 +59,7 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
     // Dependencies injected via createComponents
     private Client client;
     private SystemIndexManager systemIndexManager;
+    private ClusterService clusterService;
 
     /**
      * The default constructor.
@@ -99,6 +100,7 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
         Supplier<RepositoriesService> repositoriesServiceSupplier
     ) {
         this.client = client;
+        this.clusterService = clusterService;
 
         // Create SystemIndexManager to handle early system index creation
         this.systemIndexManager = new SystemIndexManager(client);
@@ -276,7 +278,8 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
                     provider,
                     keyProvider,
                     indexSettings.getSettings(),
-                    getSystemIndexManager()
+                    getSystemIndexManager(),
+                    getClusterService()
                 );
             } catch (Exception e) {
                 LOGGER.error("Failed to create shared resolver for index: {}", uuid, e);
@@ -306,6 +309,16 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
             throw new IllegalStateException("SystemIndexManager not available - plugin may not be fully initialized");
         }
         return systemIndexManager;
+    }
+
+    /**
+     * Gets the cluster service, throwing an exception if not available.
+     */
+    private ClusterService getClusterService() {
+        if (clusterService == null) {
+            throw new IllegalStateException("ClusterService not available - plugin may not be fully initialized");
+        }
+        return clusterService;
     }
 
     /**
