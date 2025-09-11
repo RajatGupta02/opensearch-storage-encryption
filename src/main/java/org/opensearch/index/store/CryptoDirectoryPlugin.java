@@ -354,15 +354,19 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
     @Override
     public void onNodeStarted(DiscoveryNode localNode) {
         if (systemIndexManager != null) {
-            LOGGER.info("Node started - initializing crypto system index");
+            LOGGER.info("Node started - initializing crypto system index on node: {}", localNode.getId());
 
             // Initialize system index now that cluster is ready
             boolean success = systemIndexManager.initializeSystemIndex();
 
             if (success) {
-                LOGGER.info("Crypto system index initialization completed successfully");
+                LOGGER.info("Crypto system index initialization completed successfully on node: {}", localNode.getId());
             } else {
-                LOGGER.warn("Crypto system index initialization failed - encryption operations may fail until index is created");
+                LOGGER
+                    .warn(
+                        "Crypto system index initialization failed on node: {} - encryption operations may fail until index is created",
+                        localNode.getId()
+                    );
             }
         } else {
             LOGGER.warn("SystemIndexManager not available during node startup - this should not happen");

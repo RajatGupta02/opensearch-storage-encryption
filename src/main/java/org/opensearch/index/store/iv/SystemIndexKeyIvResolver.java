@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.security.Key;
 import java.security.Provider;
 import java.security.SecureRandom;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -29,6 +30,7 @@ import org.opensearch.common.Randomness;
 import org.opensearch.common.crypto.DataKeyPair;
 import org.opensearch.common.crypto.MasterKeyProvider;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.index.store.cipher.AesCipherFactory;
@@ -275,8 +277,8 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
                 "RESOLVER_OP: Instance {} successfully loaded crypto key for index: {} - Key hash: {}, IV hash: {}",
                 instanceId,
                 indexUuid,
-                java.util.Arrays.hashCode(decryptedKeyBytes),
-                java.util.Arrays.hashCode(Base64.getDecoder().decode(document.getIv()))
+                Arrays.hashCode(decryptedKeyBytes),
+                Arrays.hashCode(Base64.getDecoder().decode(document.getIv()))
             );
     }
 
@@ -318,13 +320,17 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
 
     /**
      * Waits for the primary node to create the crypto key, then reads it.
-     * Simple retry logic with exponential backoff like DefaultKeyIvResolver.
+     * Optimized timing to reduce attempts - starts with longer initial delay
+     * since we know the primary is actively creating the key.
      * 
      * @throws IOException if timeout or other failure occurs
      */
     private void waitForKeyCreationAndRead() throws IOException {
-        int maxRetries = 10;
-        int delayMs = 200; // Start with 200ms
+        int maxRetries = 8;
+
+        // Start with a longer initial delay since we know key creation is in progress
+        // This reduces the chance of needing multiple attempts
+        int delayMs = 500; // Increased from 200ms to 500ms
 
         GetRequest getRequest = new GetRequest(CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME).id(indexUuid);
 
@@ -339,8 +345,12 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
                     return;
                 }
 
-                // Exponential backoff with jitter
-                delayMs = Math.min(delayMs * 2, 5000); // Max 5 seconds
+                // More conservative backoff - don't increase as aggressively
+                if (attempt == 1) {
+                    delayMs = 300; // Second attempt uses shorter delay
+                } else {
+                    delayMs = Math.min(delayMs * 2, 3000); // Max 3 seconds, slower growth
+                }
 
                 logger
                     .debug(
@@ -388,8 +398,8 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
                     "RESOLVER_OP: Instance {} (PRIMARY) creating new crypto key for index: {} - Key hash: {}, IV hash: {}",
                     instanceId,
                     indexUuid,
-                    java.util.Arrays.hashCode(decryptedKeyBytes),
-                    java.util.Arrays.hashCode(ivBytes)
+                    Arrays.hashCode(decryptedKeyBytes),
+                    Arrays.hashCode(ivBytes)
                 );
 
             // Create document
@@ -404,10 +414,7 @@ public class SystemIndexKeyIvResolver implements KeyIvResolver {
             // Store in system index - no race conditions since only primary writes
             IndexRequest indexRequest = new IndexRequest(CryptoSystemIndexDescriptor.CRYPTO_KEYS_INDEX_NAME)
                 .id(document.getDocumentId())
-                .source(
-                    document.toXContent(org.opensearch.common.xcontent.XContentFactory.jsonBuilder(), ToXContent.EMPTY_PARAMS).toString(),
-                    XContentType.JSON
-                )
+                .source(document.toXContent(XContentFactory.jsonBuilder(), ToXContent.EMPTY_PARAMS).toString(), XContentType.JSON)
                 .setRefreshPolicy("wait_for");
 
             IndexResponse indexResponse = client.index(indexRequest).actionGet();

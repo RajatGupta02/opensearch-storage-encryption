@@ -21,10 +21,10 @@ import org.opensearch.transport.client.Client;
  * Manages the crypto system index lifecycle as a LifecycleComponent.
  * 
  * This component ensures that the .opensearch-crypto-keys system index is created
- * early during OpenSearch startup, before any encryption operations begin.
+ * when the cluster is ready, before any encryption operations begin.
  * 
  * Key responsibilities:
- * - Create system index during doStart() phase
+ * - Create system index when cluster state is available (via onNodeStarted)
  * - Handle race conditions and cluster coordination
  * - Provide readiness status for other components
  * - Manage system index health monitoring
@@ -62,11 +62,13 @@ public class SystemIndexManager extends AbstractLifecycleComponent {
      * 
      * Basic component initialization only. System index creation is deferred until
      * the cluster is ready via initializeSystemIndex() method called from plugin's onNodeStarted().
+     * This is necessary because cluster state is null during doStart().
      */
     @Override
     protected void doStart() {
-        logger.info("Starting SystemIndexManager - deferring system index creation until cluster is ready");
-        // No system index creation here - wait for cluster to be ready
+        logger.info("Starting SystemIndexManager - system index creation will happen when cluster is ready");
+        // System index creation requires cluster state, so it's deferred to onNodeStarted()
+        systemIndexReady.set(false);
     }
 
     /**
