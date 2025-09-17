@@ -193,8 +193,9 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
      */
     @Override
     public Key getDataKey(ComponentType componentType) {
-        // Circuit breaker check - fail fast for non-retryable failures
-        if (nonRetryableFailureDetected) {
+        // Component-aware circuit breaker check
+        // TRANSLOG operations must NEVER fail - they bypass circuit breaker completely
+        if (nonRetryableFailureDetected && componentType == ComponentType.INDEX) {
             throw new RuntimeException("KMS access revoked due to previous " + permanentFailureType + " failure");
         }
 
