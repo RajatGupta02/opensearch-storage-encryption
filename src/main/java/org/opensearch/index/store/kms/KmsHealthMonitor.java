@@ -58,11 +58,11 @@ public class KmsHealthMonitor extends AbstractLifecycleComponent {
         this.client = client;
         this.clusterService = clusterService;
 
-        // Use TTL setting for monitoring interval (default: 1 hour = 3600 seconds)
-        int ttlSeconds = settings.getAsInt("index.store.kms.data_key_ttl_seconds", 3600);
-        this.monitoringInterval = TimeValue.timeValueSeconds(ttlSeconds);
+        // Use node-level TTL setting as monitoring interval
+        int defaultTtlSeconds = settings.getAsInt("index.store.kms.data_key_ttl_seconds", 120);
+        this.monitoringInterval = TimeValue.timeValueSeconds(defaultTtlSeconds);
 
-        logger.info("KMS Health Monitor initialized with interval: {} (derived from TTL setting)", monitoringInterval);
+        logger.info("KMS Health Monitor initialized with interval: {} (from node-level TTL setting)", monitoringInterval);
     }
 
     /**
@@ -79,9 +79,10 @@ public class KmsHealthMonitor extends AbstractLifecycleComponent {
 
         logger
             .warn(
-                "Registered resolver for KMS health monitoring due to {} failure. Total failed resolvers: {}",
+                "Registered resolver for KMS health monitoring due to {} failure. " + "Total failed resolvers: {}, Monitoring interval: {}",
                 failureType,
-                failedResolvers.size()
+                failedResolvers.size(),
+                monitoringInterval
             );
 
         if (wasEmpty && lifecycle.started()) {
