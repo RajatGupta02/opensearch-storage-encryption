@@ -96,7 +96,7 @@ public class KmsHealthMonitor extends AbstractLifecycleComponent {
      */
     public void unregisterResolver(DefaultKeyIvResolver resolver) {
         if (failedResolvers.remove(resolver)) {
-            logger.debug("Unregistered resolver from KMS health monitoring. Remaining failed resolvers: {}", failedResolvers.size());
+            logger.info("Unregistered resolver from KMS health monitoring. Remaining failed resolvers: {}", failedResolvers.size());
 
             if (failedResolvers.isEmpty()) {
                 stopMonitoring();
