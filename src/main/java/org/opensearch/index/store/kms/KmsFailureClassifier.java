@@ -13,8 +13,8 @@ import java.util.concurrent.TimeoutException;
  * This classification determines whether operations should continue with existing keys
  * or fail immediately with circuit breaker activation.
  * 
- * Uses pattern matching on exception types and messages since specific KMS SDK
- * exceptions may not be available depending on the MasterKeyProvider implementation.
+ * Uses HTTP status code-based classification when available, with fallback to basic
+ * exception type checking for network and timeout issues.
  * 
  * @opensearch.internal
  */
@@ -27,68 +27,82 @@ public class KmsFailureClassifier {
      * @return the failure type
      */
     public static KmsFailureType classify(Exception exception) {
-        String exceptionMessage = exception.getMessage() != null ? exception.getMessage().toLowerCase() : "";
-        String exceptionType = exception.getClass().getSimpleName().toLowerCase();
-
-        // Network and timeout related exceptions (retryable)
-        if (exception instanceof ConnectException
-            || exception instanceof SocketTimeoutException
-            || exception instanceof TimeoutException
-            || exceptionMessage.contains("timeout")
-            || exceptionMessage.contains("connection")
-            || exceptionMessage.contains("network")) {
+        // First check for network and timeout exceptions (retryable)
+        if (exception instanceof ConnectException || exception instanceof SocketTimeoutException || exception instanceof TimeoutException) {
             return KmsFailureType.NETWORK_TIMEOUT;
         }
 
-        // Rate limiting (retryable)
-        if (exceptionMessage.contains("throttl")
-            || exceptionMessage.contains("rate limit")
-            || exceptionMessage.contains("too many requests")
-            || exceptionType.contains("throttl")) {
-            return KmsFailureType.RATE_LIMITED;
-        }
-
-        // Service unavailable (retryable)
-        if (exceptionMessage.contains("service unavailable")
-            || exceptionMessage.contains("internal error")
-            || exceptionMessage.contains("temporarily unavailable")
-            || exceptionType.contains("internal")
-            || exceptionType.contains("unavailable")) {
-            return KmsFailureType.SERVICE_UNAVAILABLE;
-        }
-
-        // Key disabled (non-retryable)
-        if (exceptionMessage.contains("disabled") || exceptionMessage.contains("key is disabled") || exceptionType.contains("disabled")) {
-            return KmsFailureType.KEY_DISABLED;
-        }
-
-        // Key not found (non-retryable)
-        if (exceptionMessage.contains("not found")
-            || exceptionMessage.contains("does not exist")
-            || exceptionMessage.contains("invalid key")
-            || exceptionType.contains("notfound")
-            || exceptionType.contains("notexist")) {
-            return KmsFailureType.KEY_NOT_FOUND;
-        }
-
-        // Access denied (non-retryable)
-        if (exceptionMessage.contains("access denied")
-            || exceptionMessage.contains("unauthorized")
-            || exceptionMessage.contains("permission")
-            || exceptionMessage.contains("forbidden")
-            || exceptionType.contains("access")
-            || exceptionType.contains("unauthorized")
-            || exceptionType.contains("forbidden")) {
-            return KmsFailureType.ACCESS_DENIED;
-        }
-
-        // Invalid key state (non-retryable)
-        if (exceptionMessage.contains("invalid state") || exceptionMessage.contains("key state") || exceptionMessage.contains("unusable")) {
-            return KmsFailureType.INVALID_KEY_STATE;
+        // Try to extract HTTP status code from exception
+        int statusCode = extractHttpStatusCode(exception);
+        if (statusCode > 0) {
+            return classifyByStatusCode(statusCode);
         }
 
         // Default to network timeout for unknown exceptions (retryable)
-        // This is a conservative approach - we prefer false positives for retryable failures
+        return KmsFailureType.NETWORK_TIMEOUT;
+    }
+
+    /**
+     * Extracts HTTP status code from exception if available.
+     * 
+     * @param exception the exception to extract status code from
+     * @return the HTTP status code, or -1 if not found
+     */
+    private static int extractHttpStatusCode(Exception exception) {
+        String message = exception.getMessage();
+        if (message == null) {
+            return -1;
+        }
+
+        // Look for common HTTP status code patterns in exception messages
+        // AWS SDK typically includes status codes in format "Status Code: 403" or "(Status Code: 404)"
+        if (message.contains("Status Code:") || message.contains("status code:")) {
+            try {
+                String[] parts = message.split("(?i)status code:?\\s*");
+                if (parts.length > 1) {
+                    String statusPart = parts[1].trim();
+                    // Extract first number from the status part
+                    StringBuilder sb = new StringBuilder();
+                    for (char c : statusPart.toCharArray()) {
+                        if (Character.isDigit(c)) {
+                            sb.append(c);
+                        } else if (sb.length() > 0) {
+                            break; // Stop at first non-digit after finding digits
+                        }
+                    }
+                    if (sb.length() > 0) {
+                        return Integer.parseInt(sb.toString());
+                    }
+                }
+            } catch (NumberFormatException e) {
+                // Ignore parsing errors, fall through to default
+            }
+        }
+
+        return -1;
+    }
+
+    /**
+     * Classifies failure based on HTTP status code.
+     * 
+     * @param statusCode the HTTP status code
+     * @return the failure type
+     */
+    private static KmsFailureType classifyByStatusCode(int statusCode) {
+        if (statusCode == 429) {
+            return KmsFailureType.RATE_LIMITED;
+        } else if (statusCode >= 500 && statusCode < 600) {
+            return KmsFailureType.SERVICE_UNAVAILABLE;
+        } else if (statusCode == 403) {
+            return KmsFailureType.ACCESS_DENIED;
+        } else if (statusCode == 404) {
+            return KmsFailureType.KEY_NOT_FOUND;
+        } else if (statusCode >= 400 && statusCode < 500) {
+            // Other 4xx errors default to access denied
+            return KmsFailureType.ACCESS_DENIED;
+        }
+
+        // Unknown status codes default to retryable
         return KmsFailureType.NETWORK_TIMEOUT;
     }
 

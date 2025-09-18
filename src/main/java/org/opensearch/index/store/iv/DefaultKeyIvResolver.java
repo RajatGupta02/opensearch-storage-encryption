@@ -8,9 +8,8 @@ import java.io.IOException;
 import java.security.Key;
 import java.security.Provider;
 import java.security.SecureRandom;
+import java.time.Duration;
 import java.util.Base64;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicReference;
 
 import javax.crypto.spec.SecretKeySpec;
 
@@ -27,12 +26,17 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.index.store.cipher.AesCipherFactory;
 import org.opensearch.index.store.kms.KmsFailureClassifier;
 import org.opensearch.index.store.kms.KmsFailureType;
-import org.opensearch.index.store.kms.KmsHealthMonitor;
+
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.LoadingCache;
 
 /**
  * Default implementation of {@link KeyIvResolver} responsible for managing
  * the encryption key and initialization vector (IV) used in encrypting and decrypting
  * Lucene index files.
+ *
+ * Uses Caffeine cache for TTL-based key management with automatic refresh.
+ * Provides component-aware behavior for INDEX vs TRANSLOG operations.
  *
  * Metadata files:
  * - "keyfile" stores the encrypted data key
@@ -48,21 +52,21 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     private final MasterKeyProvider keyProvider;
     private final long ttlMillis;
 
-    // Thread-safe TTL-based data key management
-    private final AtomicReference<DataKeyHolder> dataKeyRef = new AtomicReference<>();
-    private final AtomicBoolean refreshInProgress = new AtomicBoolean(false);
+    // Caffeine cache for TTL-based key management
+    private final LoadingCache<String, Key> keyCache;
 
     // Circuit breaker state for non-retryable KMS failures
-    private volatile boolean nonRetryableFailureDetected = false;
-    private volatile KmsFailureType permanentFailureType;
+    private volatile boolean circuitBreakerActive = false;
+    private volatile KmsFailureType failureType;
 
-    // Pre-emptive refresh at 80% of TTL to avoid blocking
-    private static final double REFRESH_THRESHOLD = 0.8;
+    // Fallback key for TRANSLOG operations during failures
+    private volatile Key lastKnownKey;
 
     private String iv;
 
     private static final String IV_FILE = "ivFile";
     private static final String KEY_FILE = "keyfile";
+    private static final String CACHE_KEY = "DATA_KEY";
 
     /**
      * Constructs a new {@link DefaultKeyIvResolver} and ensures the key and IV are initialized.
@@ -81,6 +85,13 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
         // Read TTL from settings (default 1 hour)
         int ttlSeconds = settings.getAsInt("index.store.kms.data_key_ttl_seconds", 3600);
         this.ttlMillis = ttlSeconds * 1000L;
+
+        // Initialize Caffeine cache with TTL and pre-emptive refresh
+        this.keyCache = Caffeine
+            .newBuilder()
+            .expireAfterWrite(Duration.ofMillis(ttlMillis))
+            .refreshAfterWrite(Duration.ofMillis((long) (ttlMillis * 0.8))) // 80% refresh threshold
+            .build(this::loadKeyFromKMS);
 
         initialize();
     }
@@ -101,16 +112,18 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     /**
      * Attempts to load the IV from the directory.
      * If not present, it generates and persists new values.
-     * Data key is loaded synchronously during initialization.
+     * Initializes cache with initial key load.
      */
     private void initialize() throws IOException {
         try {
             iv = readStringFile(IV_FILE);
-
-            Key dataKey = new SecretKeySpec(keyProvider.decryptKey(readByteArrayFile(KEY_FILE)), "AES");
-
-            DataKeyHolder holder = new DataKeyHolder(dataKey, System.currentTimeMillis());
-            dataKeyRef.set(holder);
+            // Load initial key into cache
+            try {
+                Key initialKey = loadKeyFromKMS(CACHE_KEY);
+                lastKnownKey = initialKey;
+            } catch (Exception e) {
+                throw new IOException("Failed to load initial key from KMS", e);
+            }
         } catch (java.nio.file.NoSuchFileException e) {
             initNewKeyAndIv();
         }
@@ -120,20 +133,22 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
      * Generates a new AES data key and IV (if not present), and writes them to metadata files.
      */
     private void initNewKeyAndIv() throws IOException {
-        DataKeyPair pair = keyProvider.generateDataPair();
-        writeByteArrayFile(KEY_FILE, pair.getEncryptedKey());
+        try {
+            DataKeyPair pair = keyProvider.generateDataPair();
+            writeByteArrayFile(KEY_FILE, pair.getEncryptedKey());
 
-        byte[] ivBytes = new byte[AesCipherFactory.IV_ARRAY_LENGTH];
-        SecureRandom random = Randomness.createSecure();
-        random.nextBytes(ivBytes);
-        iv = Base64.getEncoder().encodeToString(ivBytes);
-        writeStringFile(IV_FILE, iv);
+            byte[] ivBytes = new byte[AesCipherFactory.IV_ARRAY_LENGTH];
+            SecureRandom random = Randomness.createSecure();
+            random.nextBytes(ivBytes);
+            iv = Base64.getEncoder().encodeToString(ivBytes);
+            writeStringFile(IV_FILE, iv);
 
-        byte[] decryptedKey = keyProvider.decryptKey(pair.getEncryptedKey());
-        Key dataKey = new SecretKeySpec(decryptedKey, "AES");
-
-        DataKeyHolder holder = new DataKeyHolder(dataKey, System.currentTimeMillis());
-        dataKeyRef.set(holder);
+            // Load initial key into cache
+            Key initialKey = loadKeyFromKMS(CACHE_KEY);
+            lastKnownKey = initialKey;
+        } catch (Exception e) {
+            throw new IOException("Failed to initialize new key and IV", e);
+        }
     }
 
     /**
@@ -177,6 +192,21 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     }
 
     /**
+     * Cache loader method for Caffeine cache.
+     * Loads key from KMS by decrypting the stored encrypted key.
+     */
+    private Key loadKeyFromKMS(String keyId) throws Exception {
+        byte[] encryptedKey = readByteArrayFile(KEY_FILE);
+        byte[] decryptedKey = keyProvider.decryptKey(encryptedKey);
+        Key newKey = new SecretKeySpec(decryptedKey, "AES");
+
+        // Update lastKnownKey for fallback
+        lastKnownKey = newKey;
+
+        return newKey;
+    }
+
+    /**
      * {@inheritDoc}
      * Returns the data key using default behavior (INDEX component type) for backward compatibility.
      */
@@ -195,143 +225,52 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     public Key getDataKey(ComponentType componentType) {
         // Component-aware circuit breaker check
         // TRANSLOG operations must NEVER fail - they bypass circuit breaker completely
-        if (nonRetryableFailureDetected && componentType == ComponentType.INDEX) {
-            throw new RuntimeException("KMS access revoked due to previous " + permanentFailureType + " failure");
+        if (circuitBreakerActive && componentType == ComponentType.INDEX) {
+            throw new RuntimeException("KMS access revoked due to previous " + failureType + " failure");
         }
 
-        DataKeyHolder current = dataKeyRef.get();
-
-        // Handle first-time initialization (should not happen after initialize())
-        if (current == null) {
-            synchronized (this) {
-                // Double-check after acquiring lock
-                current = dataKeyRef.get();
-                if (current != null) {
-                    return current.getDataKey();
-                }
-
-                try {
-                    byte[] encryptedKey = readByteArrayFile(KEY_FILE);
-                    byte[] decryptedKey = keyProvider.decryptKey(encryptedKey);
-                    Key newKey = new SecretKeySpec(decryptedKey, "AES");
-
-                    DataKeyHolder holder = new DataKeyHolder(newKey, System.currentTimeMillis());
-                    dataKeyRef.set(holder);
-                    logger.info("Successfully initialized data key from KMS");
-                    return newKey;
-                } catch (Exception e) {
-                    logger.error("Failed to initialize data key from KMS", e);
-                    throw new RuntimeException("Failed to initialize data key from KMS", e);
-                }
-            }
-        }
-
-        // Pre-emptive refresh - only INDEX operations can trigger this
-        if (current.needsRefresh(ttlMillis, REFRESH_THRESHOLD)) {
-            if (componentType == ComponentType.INDEX) {
-                attemptPreemptiveRefresh();
-                // Get updated reference after potential refresh
-                current = dataKeyRef.get();
-            }
-            // TRANSLOG operations: do nothing, use current key
-        }
-
-        // Handle expiration with component-specific behavior
-        if (current.isExpired(ttlMillis)) {
-            return handleExpiredKey(current, componentType);
-        }
-
-        return current.getDataKey();
-    }
-
-    /**
-     * Attempts pre-emptive refresh of the data key (only called by INDEX operations).
-     */
-    private void attemptPreemptiveRefresh() {
-        if (refreshInProgress.compareAndSet(false, true)) {
-            try {
-                refreshKeyFromKMS();
-                logger.debug("Successfully refreshed data key pre-emptively (triggered by index operations)");
-            } catch (Exception e) {
-                logger.warn("Pre-emptive data key refresh failed, will retry later", e);
-            } finally {
-                refreshInProgress.set(false);
-            }
-        }
-    }
-
-    /**
-     * Handles expired key based on component type.
-     */
-    private Key handleExpiredKey(DataKeyHolder current, ComponentType componentType) {
-        switch (componentType) {
-            case INDEX:
-                // Index operations: try refresh, handle failure based on type
-                logger.debug("Data key expired for index operations, attempting KMS refresh");
-                try {
-                    return refreshKeyFromKMS();
-                } catch (Exception e) {
-                    // Classify failure type for appropriate handling
-                    KmsFailureType failureType = KmsFailureClassifier.classify(e);
-
-                    if (KmsFailureClassifier.isRetryable(failureType)) {
-                        // Retryable failure: use existing key if available
-                        if (current != null) {
-                            logger.warn("KMS refresh failed (retryable): {}. Using expired key for index operations.", e.getMessage());
-                            return current.getDataKey();
-                        } else {
-                            throw new RuntimeException("KMS refresh failed (retryable) and no existing key available", e);
-                        }
-                    } else {
-                        // Non-retryable failure: circuit breaker already set in refreshKeyFromKMS, fail immediately
-                        throw new RuntimeException("KMS key unavailable: " + e.getMessage(), e);
-                    }
-                }
-
-            case TRANSLOG:
-                // Translog operations: never fail, use expired key
-                logger.warn("Using expired key for translog operations (KMS refresh not attempted)");
-                return current.getDataKey();
-
-            default:
-                throw new IllegalArgumentException("Unknown component type: " + componentType);
-        }
-    }
-
-    /**
-     * Refreshes the data key from KMS and updates the shared reference.
-     */
-    private Key refreshKeyFromKMS() throws Exception {
         try {
-            byte[] encryptedKey = readByteArrayFile(KEY_FILE);
-            byte[] decryptedKey = keyProvider.decryptKey(encryptedKey);
-            Key newKey = new SecretKeySpec(decryptedKey, "AES");
-
-            // Atomic update of shared datakey reference
-            DataKeyHolder newHolder = new DataKeyHolder(newKey, System.currentTimeMillis());
-            dataKeyRef.set(newHolder);
-
-            return newKey;
-
-        } catch (Exception e) {
-            // Classify KMS failure type
-            KmsFailureType failureType = KmsFailureClassifier.classify(e);
-
-            if (!KmsFailureClassifier.isRetryable(failureType)) {
-                // Set circuit breaker for non-retryable failures
-                nonRetryableFailureDetected = true;
-                permanentFailureType = failureType;
-
-                // Register with health monitor for automatic recovery
-                KmsHealthMonitor.safeRegisterFailedResolver(this, failureType);
-
-                logger.error("KMS key access failed (non-retryable): {}. Circuit breaker activated.", e.getMessage());
+            // INDEX operations: use cache (triggers KMS if needed)
+            if (componentType == ComponentType.INDEX) {
+                return keyCache.get(CACHE_KEY);
             } else {
-                logger.warn("KMS refresh failed (retryable): {}. Will retry on next TTL cycle.", e.getMessage());
+                // TRANSLOG operations: try cache first, fallback to lastKnownKey
+                Key cachedKey = keyCache.getIfPresent(CACHE_KEY);
+                if (cachedKey != null) {
+                    return cachedKey;
+                } else if (lastKnownKey != null) {
+                    logger.warn("Using expired key for translog operations (cache miss)");
+                    return lastKnownKey;
+                } else {
+                    // Should not happen after initialization
+                    throw new RuntimeException("No key available for translog operations");
+                }
             }
+        } catch (Exception e) {
+            return handleCacheFailure(e, componentType);
+        }
+    }
 
-            // Re-throw the original exception
-            throw e;
+    /**
+     * Handles cache loading failures with component-aware behavior.
+     */
+    private Key handleCacheFailure(Exception e, ComponentType componentType) {
+        KmsFailureType failureType = KmsFailureClassifier.classify(e);
+
+        if (!KmsFailureClassifier.isRetryable(failureType) && componentType == ComponentType.INDEX) {
+            // Non-retryable failure for INDEX: activate circuit breaker
+            circuitBreakerActive = true;
+            this.failureType = failureType;
+            logger.error("KMS key access failed (non-retryable): {}. Circuit breaker activated.", e.getMessage());
+            throw new RuntimeException("KMS key unavailable: " + failureType, e);
+        }
+
+        // Retryable failure OR TRANSLOG operation: use last known key
+        if (lastKnownKey != null) {
+            logger.warn("KMS refresh failed ({}): {}. Using last known key for {} operations.", failureType, e.getMessage(), componentType);
+            return lastKnownKey;
+        } else {
+            throw new RuntimeException("No fallback key available", e);
         }
     }
 
@@ -341,49 +280,6 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     @Override
     public byte[] getIvBytes() {
         return Base64.getDecoder().decode(iv);
-    }
-
-    /**
-     * Tests KMS connectivity without affecting normal operations.
-     * This method is called by the KMS health monitor to test if KMS has recovered.
-     * 
-     * @throws Exception if KMS is still unavailable
-     */
-    public void testKmsConnectivity() throws Exception {
-        // Test by attempting to decrypt the existing encrypted key
-        byte[] encryptedKey = readByteArrayFile(KEY_FILE);
-        keyProvider.decryptKey(encryptedKey);
-        // If we reach here, KMS is accessible
-    }
-
-    /**
-     * Resets the circuit breaker state, allowing KMS operations to resume.
-     * This should only be called by the KMS health monitor after confirming KMS recovery.
-     */
-    public void resetCircuitBreaker() {
-        if (nonRetryableFailureDetected) {
-            nonRetryableFailureDetected = false;
-            permanentFailureType = null;
-            logger.info("Circuit breaker reset - KMS operations can resume");
-        }
-    }
-
-    /**
-     * Checks if the circuit breaker is currently active.
-     * 
-     * @return true if circuit breaker is active (KMS operations blocked)
-     */
-    public boolean isCircuitBreakerActive() {
-        return nonRetryableFailureDetected;
-    }
-
-    /**
-     * Gets the failure type that triggered the circuit breaker.
-     * 
-     * @return the failure type, or null if circuit breaker is not active
-     */
-    public KmsFailureType getCircuitBreakerFailureType() {
-        return permanentFailureType;
     }
 
 }

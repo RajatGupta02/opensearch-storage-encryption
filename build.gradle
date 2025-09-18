@@ -62,6 +62,9 @@ dependencies {
     testImplementation "org.opensearch.test:framework:${opensearch_version}"
     testImplementation "commons-io:commons-io:2.13.0"
 
+    // Caffeine cache for TTL-based key management
+    implementation "com.github.ben-manes.caffeine:caffeine:3.1.8"
+
     // Integration test dependencies
     testImplementation "org.opensearch.plugin:reindex-client:${opensearch_version}"
     internalClusterTestImplementation "org.opensearch.plugin:reindex-client:${opensearch_version}"
