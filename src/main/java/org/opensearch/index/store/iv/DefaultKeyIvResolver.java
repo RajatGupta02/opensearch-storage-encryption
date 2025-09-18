@@ -24,6 +24,7 @@ import org.opensearch.common.crypto.DataKeyPair;
 import org.opensearch.common.crypto.MasterKeyProvider;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.index.store.cipher.AesCipherFactory;
+import org.opensearch.index.store.kms.KmsCircuitBreakerException;
 import org.opensearch.index.store.kms.KmsFailureClassifier;
 import org.opensearch.index.store.kms.KmsFailureType;
 
@@ -58,6 +59,7 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     // Circuit breaker state for non-retryable KMS failures
     private volatile boolean circuitBreakerActive = false;
     private volatile KmsFailureType failureType;
+    private volatile boolean circuitBreakerLogged = false;
 
     // Fallback key for TRANSLOG operations during failures
     private volatile Key lastKnownKey;
@@ -226,7 +228,7 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
         // Component-aware circuit breaker check
         // TRANSLOG operations must NEVER fail - they bypass circuit breaker completely
         if (circuitBreakerActive && componentType == ComponentType.INDEX) {
-            throw new RuntimeException("KMS access revoked due to previous " + failureType + " failure");
+            throw new KmsCircuitBreakerException(failureType);
         }
 
         try {
@@ -261,8 +263,19 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
             // Non-retryable failure for INDEX: activate circuit breaker
             circuitBreakerActive = true;
             this.failureType = failureType;
-            logger.error("KMS key access failed (non-retryable): {}. Circuit breaker activated.", e.getMessage());
-            throw new RuntimeException("KMS key unavailable: " + failureType, e);
+
+            // Log circuit breaker activation only once to avoid log spam
+            if (!circuitBreakerLogged) {
+                logger
+                    .error(
+                        "KMS key access failed (non-retryable): {}. Circuit breaker activated. "
+                            + "INDEX operations will be blocked until KMS recovers.",
+                        e.getMessage()
+                    );
+                circuitBreakerLogged = true;
+            }
+
+            throw new KmsCircuitBreakerException(failureType, e);
         }
 
         // Retryable failure OR TRANSLOG operation: use last known key
