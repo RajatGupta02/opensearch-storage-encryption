@@ -275,7 +275,7 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
                 circuitBreakerLogged = true;
             }
 
-            throw new KmsCircuitBreakerException(failureType, e);
+            throw new KmsCircuitBreakerException(failureType);
         }
 
         // Retryable failure OR TRANSLOG operation: use last known key
