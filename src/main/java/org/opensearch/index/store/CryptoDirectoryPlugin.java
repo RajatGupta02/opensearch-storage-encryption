@@ -55,16 +55,6 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
         return Collections.singletonMap("cryptofs", new CryptoDirectoryFactory());
     }
 
-    // @Override
-    // public void onIndexModule(IndexModule indexModule) {
-    // LOGGER.info("!!!!! onIndexModule triggered!!!!");
-    // try {
-    // Thread.sleep(5 * 60 * 1000);
-    // } catch (InterruptedException e) {
-    // e.printStackTrace();
-    // }
-    // }
-
     /**
      * {@inheritDoc}
      */

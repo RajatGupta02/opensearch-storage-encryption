@@ -56,7 +56,8 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     // Caffeine cache for TTL-based key management
     private final LoadingCache<String, Key> keyCache;
 
-    // Circuit breaker state for non-retryable KMS failures
+    // Circuit breaker state for non-retryable KMS failures with 3-strike rule
+    private volatile int revokeCounter = 0;
     private volatile boolean circuitBreakerActive = false;
     private volatile KmsFailureType failureType;
     private volatile boolean circuitBreakerLogged = false;
@@ -202,6 +203,9 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
         byte[] decryptedKey = keyProvider.decryptKey(encryptedKey);
         Key newKey = new SecretKeySpec(decryptedKey, "AES");
 
+        // Reset counter on successful KMS call
+        revokeCounter = 0;
+
         // Update lastKnownKey for fallback
         lastKnownKey = newKey;
 
@@ -254,28 +258,40 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     }
 
     /**
-     * Handles cache loading failures with component-aware behavior.
+     * Handles cache loading failures with component-aware behavior and 3-strike rule.
      */
     private Key handleCacheFailure(Exception e, ComponentType componentType) {
         KmsFailureType failureType = KmsFailureClassifier.classify(e);
 
         if (!KmsFailureClassifier.isRetryable(failureType) && componentType == ComponentType.INDEX) {
-            // Non-retryable failure for INDEX: activate circuit breaker
-            circuitBreakerActive = true;
-            this.failureType = failureType;
+            // Non-retryable failure for INDEX: apply 3-strike rule
+            revokeCounter++;
 
-            // Log circuit breaker activation only once to avoid log spam
-            if (!circuitBreakerLogged) {
-                logger
-                    .error(
-                        "KMS key access failed (non-retryable): {}. Circuit breaker activated. "
-                            + "INDEX operations will be blocked until KMS recovers.",
-                        e.getMessage()
-                    );
-                circuitBreakerLogged = true;
+            if (revokeCounter >= 2) {
+                // Strike 3: Now activate circuit breaker
+                circuitBreakerActive = true;
+                this.failureType = failureType;
+
+                // Log circuit breaker activation only once to avoid log spam
+                if (!circuitBreakerLogged) {
+                    logger
+                        .error(
+                            "KMS key access failed (attempt 2/2): {}. Circuit breaker activated. "
+                                + "INDEX operations will be blocked until KMS recovers.",
+                            e.getMessage()
+                        );
+                    circuitBreakerLogged = true;
+                }
+
+                throw new KmsCircuitBreakerException(failureType);
+            } else {
+                logger.warn("KMS refresh failed (attempts {}/2): {}. Using fallback key for INDEX operations.", revokeCounter, failureType);
+                if (lastKnownKey != null) {
+                    return lastKnownKey;
+                } else {
+                    throw new RuntimeException("No fallback key available");
+                }
             }
-
-            throw new KmsCircuitBreakerException(failureType);
         }
 
         // Retryable failure OR TRANSLOG operation: use last known key
@@ -283,7 +299,7 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
             logger.warn("KMS refresh failed ({}): {}. Using last known key for {} operations.", failureType, e.getMessage(), componentType);
             return lastKnownKey;
         } else {
-            throw new RuntimeException("No fallback key available", e);
+            throw new RuntimeException("No fallback key available");
         }
     }
 
