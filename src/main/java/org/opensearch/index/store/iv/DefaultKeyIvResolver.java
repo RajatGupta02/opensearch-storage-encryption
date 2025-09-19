@@ -122,7 +122,7 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
             iv = readStringFile(IV_FILE);
             // Load initial key into cache
             try {
-                Key initialKey = loadKeyFromKMS(CACHE_KEY);
+                Key initialKey = keyCache.get(CACHE_KEY);
                 lastKnownKey = initialKey;
             } catch (Exception e) {
                 throw new IOException("Failed to load initial key from KMS", e);
@@ -147,7 +147,7 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
             writeStringFile(IV_FILE, iv);
 
             // Load initial key into cache
-            Key initialKey = loadKeyFromKMS(CACHE_KEY);
+            Key initialKey = keyCache.get(CACHE_KEY);
             lastKnownKey = initialKey;
         } catch (Exception e) {
             throw new IOException("Failed to initialize new key and IV", e);
