@@ -98,8 +98,7 @@ public class KmsFailureClassifier {
         } else if (statusCode == 404) {
             return KmsFailureType.KEY_NOT_FOUND;
         } else if (statusCode >= 400 && statusCode < 500) {
-            // Other 4xx errors default to access denied
-            return KmsFailureType.ACCESS_DENIED;
+            return KmsFailureType.KEY_DISABLED;
         }
 
         // Unknown status codes default to retryable

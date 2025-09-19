@@ -245,10 +245,9 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
                 if (cachedKey != null) {
                     return cachedKey;
                 } else if (lastKnownKey != null) {
-                    logger.warn("Using expired key for translog operations (cache miss)");
+                    logger.debug("Using expired key for translog operations (cache miss)");
                     return lastKnownKey;
                 } else {
-                    // Should not happen after initialization
                     throw new RuntimeException("No key available for translog operations");
                 }
             }
@@ -285,7 +284,6 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
 
                 throw new KmsCircuitBreakerException(failureType);
             } else {
-                logger.warn("KMS refresh failed (attempts {}/2): {}. Using fallback key for INDEX operations.", revokeCounter, failureType);
                 if (lastKnownKey != null) {
                     return lastKnownKey;
                 } else {
