@@ -197,19 +197,67 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     /**
      * Cache loader method for Caffeine cache.
      * Loads key from KMS by decrypting the stored encrypted key.
+     * 
+     * Implements graceful retry logic for accidental KMS key revocations:
+     * - First refresh failure: Use existing key, increment counter (grace period)
+     * - Second refresh failure: Activate circuit breaker and throw exception
      */
     private Key loadKeyFromKMS(String keyId) throws Exception {
-        byte[] encryptedKey = readByteArrayFile(KEY_FILE);
-        byte[] decryptedKey = keyProvider.decryptKey(encryptedKey);
-        Key newKey = new SecretKeySpec(decryptedKey, "AES");
+        // Detect if this is a refresh operation vs initial load
+        Key existingKey = keyCache.getIfPresent(CACHE_KEY);
+        boolean isRefreshOperation = (existingKey != null || lastKnownKey != null);
 
-        // Reset counter on successful KMS call
-        revokeCounter = 0;
+        try {
+            // Attempt KMS decryption
+            byte[] encryptedKey = readByteArrayFile(KEY_FILE);
+            byte[] decryptedKey = keyProvider.decryptKey(encryptedKey);
+            Key newKey = new SecretKeySpec(decryptedKey, "AES");
 
-        // Update lastKnownKey for fallback
-        lastKnownKey = newKey;
+            // SUCCESS: Reset all failure state
+            revokeCounter = 0;
+            circuitBreakerActive = false;
+            circuitBreakerLogged = false;
+            lastKnownKey = newKey;
 
-        return newKey;
+            logger.debug("Successfully {} key from KMS", isRefreshOperation ? "refreshed" : "loaded");
+
+            return newKey;
+
+        } catch (Exception e) {
+            if (isRefreshOperation) {
+                KmsFailureType failureType = KmsFailureClassifier.classify(e);
+
+                if (!KmsFailureClassifier.isRetryable(failureType)) {
+                    revokeCounter++;
+
+                    if (revokeCounter == 1) {
+                        // First failure: Grace period - return existing key, don't throw
+                        logger.warn("KMS refresh failed (attempt 1/2): {}. Using cached key, will retry next TTL cycle.", e.getMessage());
+                        return lastKnownKey;
+
+                    } else {
+                        // Second failure: Activate circuit breaker and throw
+                        circuitBreakerActive = true;
+                        this.failureType = failureType;
+
+                        if (!circuitBreakerLogged) {
+                            logger.error("KMS refresh failed for 2 consecutive TTL cycles: {}. Circuit breaker activated.", e.getMessage());
+                            circuitBreakerLogged = true;
+                        }
+
+                        throw new RuntimeException("KMS access failed persistently after 2 TTL cycles", e);
+                    }
+                } else {
+                    // Retryable error during refresh - use existing key
+                    logger.warn("KMS refresh failed with retryable error: {}. Using cached key.", e.getMessage());
+                    return lastKnownKey;
+                }
+            }
+
+            // Initial load failure OR non-refresh operations: always propagate exception
+            logger.error("KMS initial load failed: {}", e.getMessage());
+            throw e;
+        }
     }
 
     /**
@@ -224,19 +272,20 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     /**
      * {@inheritDoc}
      * Returns the data key with component-specific behavior for KMS refresh.
-     * INDEX operations can trigger KMS refresh and fail on unavailability.
-     * TRANSLOG operations never trigger KMS refresh and never fail.
+     * INDEX operations can trigger KMS refresh and fail on circuit breaker activation.
+     * TRANSLOG operations never fail and always get a key.
      */
     @Override
     public Key getDataKey(ComponentType componentType) {
         // Component-aware circuit breaker check
         // TRANSLOG operations must NEVER fail - they bypass circuit breaker completely
         if (circuitBreakerActive && componentType == ComponentType.INDEX) {
+            logger.debug("Circuit breaker active, blocking INDEX operation");
             throw new KmsCircuitBreakerException(failureType);
         }
 
         try {
-            // INDEX operations: use cache (triggers KMS if needed)
+            // INDEX operations: use cache (triggers KMS refresh if needed)
             if (componentType == ComponentType.INDEX) {
                 return keyCache.get(CACHE_KEY);
             } else {
@@ -252,52 +301,20 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
                 }
             }
         } catch (Exception e) {
-            return handleCacheFailure(e, componentType);
-        }
-    }
-
-    /**
-     * Handles cache loading failures with component-aware behavior and 3-strike rule.
-     */
-    private Key handleCacheFailure(Exception e, ComponentType componentType) {
-        KmsFailureType failureType = KmsFailureClassifier.classify(e);
-
-        if (!KmsFailureClassifier.isRetryable(failureType) && componentType == ComponentType.INDEX) {
-            // Non-retryable failure for INDEX: apply 3-strike rule
-            revokeCounter++;
-
-            if (revokeCounter >= 2) {
-                // Strike 3: Now activate circuit breaker
-                circuitBreakerActive = true;
-                this.failureType = failureType;
-
-                // Log circuit breaker activation only once to avoid log spam
-                if (!circuitBreakerLogged) {
-                    logger
-                        .error(
-                            "KMS key access failed (attempt 2/2): {}. Circuit breaker activated. "
-                                + "INDEX operations will be blocked until KMS recovers.",
-                            e.getMessage()
-                        );
-                    circuitBreakerLogged = true;
-                }
-
-                throw new KmsCircuitBreakerException(failureType);
-            } else {
-                if (lastKnownKey != null) {
-                    return lastKnownKey;
-                } else {
-                    throw new RuntimeException("No fallback key available");
-                }
+            // Cache loading failed - all retry logic is handled in loadKeyFromKMS
+            // If we get here, it means the cache loader threw an exception after exhausting retries
+            if (e instanceof RuntimeException && e.getMessage().contains("KMS access failed persistently")) {
+                // This is a circuit breaker activation from the cache loader
+                throw e;
             }
-        }
 
-        // Retryable failure OR TRANSLOG operation: use last known key
-        if (lastKnownKey != null) {
-            logger.warn("KMS refresh failed ({}): {}. Using last known key for {} operations.", failureType, e.getMessage(), componentType);
-            return lastKnownKey;
-        } else {
-            throw new RuntimeException("No fallback key available");
+            // For other exceptions, try to use lastKnownKey as fallback
+            if (lastKnownKey != null) {
+                logger.warn("Cache access failed: {}. Using last known key for {} operations.", e.getMessage(), componentType);
+                return lastKnownKey;
+            } else {
+                throw new RuntimeException("No fallback key available", e);
+            }
         }
     }
 
