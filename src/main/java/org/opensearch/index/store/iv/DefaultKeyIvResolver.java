@@ -8,7 +8,6 @@ import java.io.IOException;
 import java.security.Key;
 import java.security.Provider;
 import java.security.SecureRandom;
-import java.time.Duration;
 import java.util.Base64;
 
 import javax.crypto.spec.SecretKeySpec;
@@ -28,15 +27,12 @@ import org.opensearch.index.store.kms.KmsCircuitBreakerException;
 import org.opensearch.index.store.kms.KmsFailureClassifier;
 import org.opensearch.index.store.kms.KmsFailureType;
 
-import com.github.benmanes.caffeine.cache.Caffeine;
-import com.github.benmanes.caffeine.cache.LoadingCache;
-
 /**
  * Default implementation of {@link KeyIvResolver} responsible for managing
  * the encryption key and initialization vector (IV) used in encrypting and decrypting
  * Lucene index files.
  *
- * Uses Caffeine cache for TTL-based key management with automatic refresh.
+ * Uses node-level cache for TTL-based key management with automatic refresh.
  * Provides component-aware behavior for INDEX vs TRANSLOG operations.
  *
  * Metadata files:
@@ -49,12 +45,10 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
 
     private static final Logger logger = LogManager.getLogger(DefaultKeyIvResolver.class);
 
+    private final String indexUuid;
     private final Directory directory;
     private final MasterKeyProvider keyProvider;
     private final long ttlMillis;
-
-    // Caffeine cache for TTL-based key management
-    private final LoadingCache<String, Key> keyCache;
 
     // Circuit breaker state for non-retryable KMS failures with 3-strike rule
     private volatile int revokeCounter = 0;
@@ -69,32 +63,26 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
 
     private static final String IV_FILE = "ivFile";
     private static final String KEY_FILE = "keyfile";
-    private static final String CACHE_KEY = "DATA_KEY";
 
     /**
      * Constructs a new {@link DefaultKeyIvResolver} and ensures the key and IV are initialized.
      *
+     * @param indexUuid the unique identifier for the index
      * @param directory the Lucene directory to read/write metadata files
      * @param provider the JCE provider used for cipher operations
      * @param keyProvider the master key provider used to encrypt/decrypt data keys
      * @param settings the settings containing TTL configuration
      * @throws IOException if an I/O error occurs while reading or writing key/IV metadata
      */
-    public DefaultKeyIvResolver(Directory directory, Provider provider, MasterKeyProvider keyProvider, Settings settings)
+    public DefaultKeyIvResolver(String indexUuid, Directory directory, Provider provider, MasterKeyProvider keyProvider, Settings settings)
         throws IOException {
+        this.indexUuid = indexUuid;
         this.directory = directory;
         this.keyProvider = keyProvider;
 
-        // Read TTL from settings (default 1 hour)
-        int ttlSeconds = settings.getAsInt("index.store.kms.data_key_ttl_seconds", 3600);
-        this.ttlMillis = ttlSeconds * 1000L;
-
-        // Initialize Caffeine cache with TTL and pre-emptive refresh
-        this.keyCache = Caffeine
-            .newBuilder()
-            .expireAfterWrite(Duration.ofMillis(ttlMillis))
-            .refreshAfterWrite(Duration.ofMillis((long) (ttlMillis * 0.8))) // 80% refresh threshold
-            .build(this::loadKeyFromKMS);
+        // Read TTL from settings (default -1 means use global TTL)
+        int ttlSeconds = settings.getAsInt("index.store.kms.data_key_ttl_seconds", -1);
+        this.ttlMillis = ttlSeconds > 0 ? ttlSeconds * 1000L : -1;
 
         initialize();
     }
@@ -103,13 +91,25 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
      * Constructs a new {@link DefaultKeyIvResolver} with default TTL settings.
      * This constructor is kept for backward compatibility.
      *
+     * @param indexUuid the unique identifier for the index
      * @param directory the Lucene directory to read/write metadata files
      * @param provider the JCE provider used for cipher operations
      * @param keyProvider the master key provider used to encrypt/decrypt data keys
      * @throws IOException if an I/O error occurs while reading or writing key/IV metadata
      */
-    public DefaultKeyIvResolver(Directory directory, Provider provider, MasterKeyProvider keyProvider) throws IOException {
-        this(directory, provider, keyProvider, Settings.EMPTY);
+    public DefaultKeyIvResolver(String indexUuid, Directory directory, Provider provider, MasterKeyProvider keyProvider)
+        throws IOException {
+        this(indexUuid, directory, provider, keyProvider, Settings.EMPTY);
+    }
+
+    /**
+     * Gets the TTL in milliseconds for this resolver.
+     * Used by the node-level cache to determine per-index TTL.
+     * 
+     * @return TTL in milliseconds, or -1 to use global TTL
+     */
+    long getTtlMillis() {
+        return ttlMillis;
     }
 
     /**
@@ -122,7 +122,7 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
             iv = readStringFile(IV_FILE);
             // Load initial key into cache
             try {
-                Key initialKey = keyCache.get(CACHE_KEY);
+                Key initialKey = NodeLevelKeyCache.getInstance().get(indexUuid, this);
                 lastKnownKey = initialKey;
             } catch (Exception e) {
                 throw new IOException("Failed to load initial key from KMS", e);
@@ -147,7 +147,7 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
             writeStringFile(IV_FILE, iv);
 
             // Load initial key into cache
-            Key initialKey = keyCache.get(CACHE_KEY);
+            Key initialKey = NodeLevelKeyCache.getInstance().get(indexUuid, this);
             lastKnownKey = initialKey;
         } catch (Exception e) {
             throw new IOException("Failed to initialize new key and IV", e);
@@ -195,16 +195,16 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     }
 
     /**
-     * Cache loader method for Caffeine cache.
      * Loads key from KMS by decrypting the stored encrypted key.
+     * This method is called by the node-level cache.
      * 
      * Implements graceful retry logic for accidental KMS key revocations:
      * - First refresh failure: Use existing key, increment counter (grace period)
      * - Second refresh failure: Activate circuit breaker and throw exception
      */
-    private Key loadKeyFromKMS(String keyId) throws Exception {
+    Key loadKeyFromKMS() throws Exception {
         // Detect if this is a refresh operation vs initial load
-        Key existingKey = keyCache.getIfPresent(CACHE_KEY);
+        Key existingKey = NodeLevelKeyCache.getInstance().getIfPresent(indexUuid);
         boolean isRefreshOperation = (existingKey != null || lastKnownKey != null);
 
         try {
@@ -287,10 +287,10 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
         try {
             // INDEX operations: use cache (triggers KMS refresh if needed)
             if (componentType == ComponentType.INDEX) {
-                return keyCache.get(CACHE_KEY);
+                return NodeLevelKeyCache.getInstance().get(indexUuid, this);
             } else {
                 // TRANSLOG operations: try cache first, fallback to lastKnownKey
-                Key cachedKey = keyCache.getIfPresent(CACHE_KEY);
+                Key cachedKey = NodeLevelKeyCache.getInstance().getIfPresent(indexUuid);
                 if (cachedKey != null) {
                     return cachedKey;
                 } else if (lastKnownKey != null) {
@@ -303,9 +303,9 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
         } catch (Exception e) {
             // Cache loading failed - all retry logic is handled in loadKeyFromKMS
             // If we get here, it means the cache loader threw an exception after exhausting retries
-            if (e instanceof RuntimeException && e.getMessage().contains("KMS access failed persistently")) {
+            if (e instanceof RuntimeException && e.getMessage() != null && e.getMessage().contains("KMS access failed persistently")) {
                 // This is a circuit breaker activation from the cache loader
-                throw e;
+                throw (RuntimeException) e;
             }
 
             // For other exceptions, try to use lastKnownKey as fallback

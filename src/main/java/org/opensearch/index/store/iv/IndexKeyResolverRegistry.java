@@ -54,7 +54,7 @@ public class IndexKeyResolverRegistry {
         return resolverCache.computeIfAbsent(indexUuid, uuid -> {
             try {
                 logger.debug("Creating new KeyIvResolver for index: {}", uuid);
-                return new DefaultKeyIvResolver(indexDirectory, provider, keyProvider, settings);
+                return new DefaultKeyIvResolver(indexUuid, indexDirectory, provider, keyProvider, settings);
             } catch (IOException e) {
                 logger.error("Failed to create KeyIvResolver for index: {}", uuid, e);
                 throw new RuntimeException("Failed to create KeyIvResolver for index: " + uuid, e);
@@ -65,6 +65,7 @@ public class IndexKeyResolverRegistry {
     /**
      * Removes the cached resolver for the specified index UUID.
      * This should be called when an index is deleted to prevent memory leaks.
+     * Also evicts the key from the node-level cache.
      * 
      * @param indexUuid the unique identifier for the index
      * @return the removed resolver, or null if no resolver was cached for this index
@@ -72,7 +73,14 @@ public class IndexKeyResolverRegistry {
     public static KeyIvResolver removeResolver(String indexUuid) {
         KeyIvResolver removed = resolverCache.remove(indexUuid);
         if (removed != null) {
-            logger.debug("Removed cached KeyIvResolver for index: {}", indexUuid);
+            // Evict from node-level cache when index is removed
+            try {
+                NodeLevelKeyCache.getInstance().evict(indexUuid);
+            } catch (IllegalStateException e) {
+                // NodeLevelKeyCache might not be initialized in tests
+                logger.debug("Could not evict from NodeLevelKeyCache: {}", e.getMessage());
+            }
+            logger.debug("Removed cached KeyIvResolver and evicted key for index: {}", indexUuid);
         }
         return removed;
     }

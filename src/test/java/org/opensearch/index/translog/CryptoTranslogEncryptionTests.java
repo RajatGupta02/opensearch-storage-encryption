@@ -21,6 +21,7 @@ import org.opensearch.common.crypto.MasterKeyProvider;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.index.store.iv.DefaultKeyIvResolver;
 import org.opensearch.index.store.iv.KeyIvResolver;
+import org.opensearch.index.store.iv.NodeLevelKeyCache;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -40,7 +41,19 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
         super.setUp();
         tempDir = Files.createTempDirectory("crypto-translog-encryption-test");
 
-        Settings settings = Settings.builder().put("index.store.crypto.provider", "SunJCE").put("index.store.kms.type", "test").build();
+        // Initialize NodeLevelKeyCache with test settings
+        Settings nodeSettings = Settings
+            .builder()
+            .put("node.store.kms.data_key_ttl_seconds", 300) // 5 minutes for tests
+            .build();
+        NodeLevelKeyCache.initialize(nodeSettings);
+
+        Settings indexSettings = Settings
+            .builder()
+            .put("index.store.crypto.provider", "SunJCE")
+            .put("index.store.kms.type", "test")
+            .put("index.store.kms.data_key_ttl_seconds", -1) // Use node-level TTL
+            .build();
 
         Provider cryptoProvider = Security.getProvider("SunJCE");
 
@@ -74,8 +87,17 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
             }
         };
 
+        // Use a test index UUID
+        String testIndexUuid = "test-index-uuid-" + System.currentTimeMillis();
         org.apache.lucene.store.Directory directory = new org.apache.lucene.store.NIOFSDirectory(tempDir);
-        keyIvResolver = new DefaultKeyIvResolver(directory, cryptoProvider, keyProvider);
+        keyIvResolver = new DefaultKeyIvResolver(testIndexUuid, directory, cryptoProvider, keyProvider, indexSettings);
+    }
+
+    @Override
+    public void tearDown() throws Exception {
+        // Reset the NodeLevelKeyCache singleton to prevent test pollution
+        NodeLevelKeyCache.reset();
+        super.tearDown();
     }
 
     public void testTranslogDataIsActuallyEncrypted() throws IOException {
