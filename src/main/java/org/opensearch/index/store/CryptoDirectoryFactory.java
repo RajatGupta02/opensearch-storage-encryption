@@ -73,15 +73,8 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
     }, Property.NodeScope, Property.IndexScope);
 
     /**
-     * Specifies the TTL for data keys in seconds before they are refreshed from KMS. Default is 3600 seconds (1 hour).
-     * This is a per-index setting that can override the node-level default.
-     */
-    public static final Setting<Integer> KMS_DATA_KEY_TTL_SECONDS_SETTING = Setting
-        .intSetting("index.store.kms.data_key_ttl_seconds", -1, -1, Property.IndexScope);
-
-    /**
-     * Specifies the node-level default TTL for data keys in seconds. Default is 3600 seconds (1 hour).
-     * Individual indices can override this with the index-level setting.
+     * Specifies the node-level TTL for data keys in seconds. Default is 3600 seconds (1 hour).
+     * This setting applies globally to all indices.
      */
     public static final Setting<Integer> NODE_KMS_DATA_KEY_TTL_SECONDS_SETTING = Setting
         .intSetting("node.store.kms.data_key_ttl_seconds", 3600, 1, Property.NodeScope);
@@ -136,8 +129,7 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
 
         // Use shared resolver registry to prevent race conditions
         String indexUuid = indexSettings.getIndex().getUUID();
-        KeyIvResolver keyIvResolver = IndexKeyResolverRegistry
-            .getOrCreateResolver(indexUuid, indexKeyDirectory, provider, keyProvider, indexSettings.getSettings());
+        KeyIvResolver keyIvResolver = IndexKeyResolverRegistry.getOrCreateResolver(indexUuid, indexKeyDirectory, provider, keyProvider);
 
         IndexModule.Type type = IndexModule.defaultStoreType(IndexModule.NODE_STORE_ALLOW_MMAP.get(indexSettings.getNodeSettings()));
         Set<String> preLoadExtensions = new HashSet<>(indexSettings.getValue(IndexModule.INDEX_STORE_PRE_LOAD_SETTING));

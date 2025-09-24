@@ -7,6 +7,7 @@ package org.opensearch.index.store.iv;
 import java.security.Key;
 import java.util.Objects;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.TimeUnit;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -14,12 +15,11 @@ import org.opensearch.common.settings.Settings;
 
 import com.github.benmanes.caffeine.cache.CacheLoader;
 import com.github.benmanes.caffeine.cache.Caffeine;
-import com.github.benmanes.caffeine.cache.Expiry;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 
 /**
  * Node-level cache for encryption keys used across all indices.
- * Provides centralized key management with per-index TTL override support.
+ * Provides centralized key management with global TTL configuration.
  * 
  * This cache replaces the per-resolver Caffeine caches to reduce memory overhead
  * and provide better cache utilization across indices.
@@ -37,7 +37,7 @@ public class NodeLevelKeyCache {
 
     /**
      * Cache key that includes index UUID and resolver reference.
-     * The resolver is used for callbacks to load keys and get per-index TTL.
+     * The resolver is used for callbacks to load keys from KMS.
      */
     static class CacheKey {
         final String indexUuid;
@@ -99,76 +99,45 @@ public class NodeLevelKeyCache {
     }
 
     /**
-     * Constructs the cache with custom expiry policy for per-index TTL support.
+     * Constructs the cache with global TTL configuration.
+     * Keys are refreshed at 80% of their TTL to avoid latency spikes.
      * 
      * @param globalTtlMillis the global TTL in milliseconds
      */
     private NodeLevelKeyCache(long globalTtlMillis) {
         this.globalTtlMillis = globalTtlMillis;
 
-        // Create cache with custom expiry policy
-        this.keyCache = Caffeine.newBuilder().expireAfter(new Expiry<CacheKey, Key>() {
-            @Override
-            public long expireAfterCreate(CacheKey key, Key value, long currentTime) {
-                return getTtlNanosForIndex(key);
-            }
+        // Calculate refresh interval as 80% of TTL
+        long refreshIntervalMillis = (long) (globalTtlMillis * 0.8);
 
-            @Override
-            public long expireAfterUpdate(CacheKey key, Key value, long currentTime, long currentDuration) {
-                return getTtlNanosForIndex(key);
-            }
-
-            @Override
-            public long expireAfterRead(CacheKey key, Key value, long currentTime, long currentDuration) {
-                return currentDuration; // Don't change on read
-            }
-        }).build(new CacheLoader<CacheKey, Key>() {
-            @Override
-            public Key load(CacheKey key) throws Exception {
-                return loadKey(key);
-            }
-
-            @Override
-            public Key reload(CacheKey key, Key oldValue) throws Exception {
-                // Enable pre-emptive refresh at 80% of TTL
-                long ttlMillis = getTtlMillisForIndex(key);
-                long refreshThreshold = (long) (ttlMillis * 0.8);
-
-                // Delegate to resolver's loadKeyFromKMS logic
-                if (key.resolver != null) {
-                    return key.resolver.loadKeyFromKMS();
-                } else {
-                    throw new IllegalStateException("Cannot reload key without resolver");
+        // Create cache with simple fixed-duration expiry and refresh policies
+        this.keyCache = Caffeine
+            .newBuilder()
+            // Expire keys after the global TTL
+            .expireAfterWrite(globalTtlMillis, TimeUnit.MILLISECONDS)
+            // Refresh keys at 80% of TTL to avoid latency spikes
+            .refreshAfterWrite(refreshIntervalMillis, TimeUnit.MILLISECONDS)
+            .build(new CacheLoader<CacheKey, Key>() {
+                @Override
+                public Key load(CacheKey key) throws Exception {
+                    return loadKey(key);
                 }
-            }
-        });
-    }
 
-    /**
-     * Gets the TTL for a specific index in nanoseconds.
-     * 
-     * @param key the cache key
-     * @return TTL in nanoseconds
-     */
-    private long getTtlNanosForIndex(CacheKey key) {
-        return getTtlMillisForIndex(key) * 1_000_000L;
-    }
+                @Override
+                public Key reload(CacheKey key, Key oldValue) throws Exception {
+                    // Background refresh
+                    logger.debug("Background refresh triggered for index: {}", key.indexUuid);
 
-    /**
-     * Gets the TTL for a specific index in milliseconds.
-     * Uses per-index override if available, otherwise falls back to global TTL.
-     * 
-     * @param key the cache key
-     * @return TTL in milliseconds
-     */
-    private long getTtlMillisForIndex(CacheKey key) {
-        if (key.resolver != null) {
-            long indexTtl = key.resolver.getTtlMillis();
-            if (indexTtl > 0) {
-                return indexTtl;
-            }
-        }
-        return globalTtlMillis;
+                    // Delegate to resolver's loadKeyFromKMS logic
+                    if (key.resolver != null) {
+                        Key newKey = key.resolver.loadKeyFromKMS();
+                        logger.debug("Background refresh successful for index: {}", key.indexUuid);
+                        return newKey;
+                    } else {
+                        throw new IllegalStateException("Cannot reload key without resolver");
+                    }
+                }
+            });
     }
 
     /**
@@ -214,7 +183,6 @@ public class NodeLevelKeyCache {
 
     /**
      * Gets a key from the cache if present, without loading.
-     * 
      * @param indexUuid the index UUID
      * @return the encryption key, or null if not present
      */
@@ -226,7 +194,6 @@ public class NodeLevelKeyCache {
     /**
      * Evicts a key from the cache.
      * This should be called when an index is deleted.
-     * 
      * @param indexUuid the index UUID
      */
     public void evict(String indexUuid) {

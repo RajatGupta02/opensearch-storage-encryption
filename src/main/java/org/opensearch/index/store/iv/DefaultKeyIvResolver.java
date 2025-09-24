@@ -21,7 +21,6 @@ import org.apache.lucene.store.IndexOutput;
 import org.opensearch.common.Randomness;
 import org.opensearch.common.crypto.DataKeyPair;
 import org.opensearch.common.crypto.MasterKeyProvider;
-import org.opensearch.common.settings.Settings;
 import org.opensearch.index.store.cipher.AesCipherFactory;
 import org.opensearch.index.store.kms.KmsCircuitBreakerException;
 import org.opensearch.index.store.kms.KmsFailureClassifier;
@@ -48,7 +47,6 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
     private final String indexUuid;
     private final Directory directory;
     private final MasterKeyProvider keyProvider;
-    private final long ttlMillis;
 
     // Circuit breaker state for non-retryable KMS failures with 3-strike rule
     private volatile int revokeCounter = 0;
@@ -71,45 +69,15 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
      * @param directory the Lucene directory to read/write metadata files
      * @param provider the JCE provider used for cipher operations
      * @param keyProvider the master key provider used to encrypt/decrypt data keys
-     * @param settings the settings containing TTL configuration
      * @throws IOException if an I/O error occurs while reading or writing key/IV metadata
      */
-    public DefaultKeyIvResolver(String indexUuid, Directory directory, Provider provider, MasterKeyProvider keyProvider, Settings settings)
+    public DefaultKeyIvResolver(String indexUuid, Directory directory, Provider provider, MasterKeyProvider keyProvider)
         throws IOException {
         this.indexUuid = indexUuid;
         this.directory = directory;
         this.keyProvider = keyProvider;
 
-        // Read TTL from settings (default -1 means use global TTL)
-        int ttlSeconds = settings.getAsInt("index.store.kms.data_key_ttl_seconds", -1);
-        this.ttlMillis = ttlSeconds > 0 ? ttlSeconds * 1000L : -1;
-
         initialize();
-    }
-
-    /**
-     * Constructs a new {@link DefaultKeyIvResolver} with default TTL settings.
-     * This constructor is kept for backward compatibility.
-     *
-     * @param indexUuid the unique identifier for the index
-     * @param directory the Lucene directory to read/write metadata files
-     * @param provider the JCE provider used for cipher operations
-     * @param keyProvider the master key provider used to encrypt/decrypt data keys
-     * @throws IOException if an I/O error occurs while reading or writing key/IV metadata
-     */
-    public DefaultKeyIvResolver(String indexUuid, Directory directory, Provider provider, MasterKeyProvider keyProvider)
-        throws IOException {
-        this(indexUuid, directory, provider, keyProvider, Settings.EMPTY);
-    }
-
-    /**
-     * Gets the TTL in milliseconds for this resolver.
-     * Used by the node-level cache to determine per-index TTL.
-     * 
-     * @return TTL in milliseconds, or -1 to use global TTL
-     */
-    long getTtlMillis() {
-        return ttlMillis;
     }
 
     /**
@@ -203,6 +171,12 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
      * - Second refresh failure: Activate circuit breaker and throw exception
      */
     Key loadKeyFromKMS() throws Exception {
+        // Check circuit breaker first to avoid unnecessary KMS calls
+        if (circuitBreakerActive) {
+            logger.info("Circuit breaker active, failing fast without KMS call");
+            throw new RuntimeException("KMS access failed persistently after 2 TTL cycles");
+        }
+
         // Detect if this is a refresh operation vs initial load
         Key existingKey = NodeLevelKeyCache.getInstance().getIfPresent(indexUuid);
         boolean isRefreshOperation = (existingKey != null || lastKnownKey != null);

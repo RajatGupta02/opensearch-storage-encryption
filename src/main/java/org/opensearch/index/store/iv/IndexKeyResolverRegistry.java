@@ -13,7 +13,6 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.Directory;
 import org.opensearch.common.crypto.MasterKeyProvider;
-import org.opensearch.common.settings.Settings;
 
 /**
  * Registry that ensures only one KeyIvResolver instance exists per index UUID.
@@ -40,7 +39,6 @@ public class IndexKeyResolverRegistry {
      * @param indexDirectory the directory where encryption keys are stored
      * @param provider the JCE provider for cryptographic operations
      * @param keyProvider the master key provider for KMS operations
-     * @param settings the index settings containing TTL and other configurations
      * @return the KeyIvResolver instance for this index
      * @throws RuntimeException if resolver creation fails
      */
@@ -48,13 +46,12 @@ public class IndexKeyResolverRegistry {
         String indexUuid,
         Directory indexDirectory,
         Provider provider,
-        MasterKeyProvider keyProvider,
-        Settings settings
+        MasterKeyProvider keyProvider
     ) {
         return resolverCache.computeIfAbsent(indexUuid, uuid -> {
             try {
                 logger.debug("Creating new KeyIvResolver for index: {}", uuid);
-                return new DefaultKeyIvResolver(indexUuid, indexDirectory, provider, keyProvider, settings);
+                return new DefaultKeyIvResolver(indexUuid, indexDirectory, provider, keyProvider);
             } catch (IOException e) {
                 logger.error("Failed to create KeyIvResolver for index: {}", uuid, e);
                 throw new RuntimeException("Failed to create KeyIvResolver for index: " + uuid, e);

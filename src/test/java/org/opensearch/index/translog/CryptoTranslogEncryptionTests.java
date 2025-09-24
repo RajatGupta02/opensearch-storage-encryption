@@ -48,13 +48,6 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
             .build();
         NodeLevelKeyCache.initialize(nodeSettings);
 
-        Settings indexSettings = Settings
-            .builder()
-            .put("index.store.crypto.provider", "SunJCE")
-            .put("index.store.kms.type", "test")
-            .put("index.store.kms.data_key_ttl_seconds", -1) // Use node-level TTL
-            .build();
-
         Provider cryptoProvider = Security.getProvider("SunJCE");
 
         // Create a mock key provider for testing
@@ -90,7 +83,7 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
         // Use a test index UUID
         String testIndexUuid = "test-index-uuid-" + System.currentTimeMillis();
         org.apache.lucene.store.Directory directory = new org.apache.lucene.store.NIOFSDirectory(tempDir);
-        keyIvResolver = new DefaultKeyIvResolver(testIndexUuid, directory, cryptoProvider, keyProvider, indexSettings);
+        keyIvResolver = new DefaultKeyIvResolver(testIndexUuid, directory, cryptoProvider, keyProvider);
     }
 
     @Override
