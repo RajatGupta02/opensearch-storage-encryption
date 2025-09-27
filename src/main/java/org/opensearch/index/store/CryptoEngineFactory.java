@@ -13,10 +13,10 @@ import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
 import org.opensearch.common.crypto.MasterKeyProvider;
+import org.opensearch.index.engine.CryptoEngine;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineFactory;
-import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.store.iv.IndexKeyResolverRegistry;
 import org.opensearch.index.store.iv.KeyIvResolver;
 import org.opensearch.index.translog.CryptoTranslogFactory;
@@ -55,8 +55,8 @@ public class CryptoEngineFactory implements EngineFactory {
                 .translogFactory(cryptoTranslogFactory)  // <- Replace with our crypto factory
                 .build();
 
-            // Return the default engine with crypto-enabled translog
-            return new InternalEngine(cryptoConfig);
+            // Return our custom engine that blocks operations when circuit breaker is active
+            return new CryptoEngine(cryptoConfig, keyIvResolver);
         } catch (IOException e) {
             throw new RuntimeException("Failed to create crypto engine", e);
         }

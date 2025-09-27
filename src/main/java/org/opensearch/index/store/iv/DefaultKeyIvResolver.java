@@ -300,4 +300,14 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
         return Base64.getDecoder().decode(iv);
     }
 
+    /**
+     * Checks if the circuit breaker is currently active.
+     * This is used by the CryptoEngine to block new indexing operations.
+     * 
+     * @return true if circuit breaker is active, false otherwise
+     */
+    public boolean isCircuitBreakerActive() {
+        return circuitBreakerActive;
+    }
+
 }
