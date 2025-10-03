@@ -50,10 +50,8 @@ public class IndexKeyResolverRegistry {
     ) {
         return resolverCache.computeIfAbsent(indexUuid, uuid -> {
             try {
-                logger.debug("Creating new KeyIvResolver for index: {}", uuid);
                 return new DefaultKeyIvResolver(indexUuid, indexDirectory, provider, keyProvider);
             } catch (IOException e) {
-                logger.error("Failed to create KeyIvResolver for index: {}", uuid, e);
                 throw new RuntimeException("Failed to create KeyIvResolver for index: " + uuid, e);
             }
         });
@@ -77,7 +75,7 @@ public class IndexKeyResolverRegistry {
                 // NodeLevelKeyCache might not be initialized in tests
                 logger.debug("Could not evict from NodeLevelKeyCache: {}", e.getMessage());
             }
-            logger.debug("Removed cached KeyIvResolver and evicted key for index: {}", indexUuid);
+            logger.info("Removed cached KeyIvResolver and evicted key for index: {}", indexUuid);
         }
         return removed;
     }
@@ -101,7 +99,6 @@ public class IndexKeyResolverRegistry {
     public static int clearCache() {
         int size = resolverCache.size();
         resolverCache.clear();
-        logger.debug("Cleared {} cached KeyIvResolver instances", size);
         return size;
     }
 
