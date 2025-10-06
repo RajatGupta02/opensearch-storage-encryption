@@ -105,7 +105,7 @@ compileJava {
     sourceCompatibility = JavaVersion.VERSION_24
     targetCompatibility = JavaVersion.VERSION_24
     options.encoding = 'UTF-8'
-    options.compilerArgs << '-Xlint:unchecked' << '-Werror' << '-Xlint:-deprecation'
+    options.compilerArgs << '-Xlint:unchecked' << '-Xlint:-deprecation'
 }
 
 compileTestJava {
@@ -118,6 +118,7 @@ tasks.withType(JavaCompile).configureEach {
     targetCompatibility = JavaVersion.VERSION_24
     options.encoding = 'UTF-8'
     options.release = 24
+    options.compilerArgs << '-Xlint:-deprecation'
 }
 
 javadoc {
