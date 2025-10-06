@@ -16,7 +16,7 @@ jobs:
       product: opensearch
 
   build-linux:
-    name: build
+    name: gradle assemble
     needs: ["Get-CI-Image-Tag"]
     strategy:
       fail-fast: false
