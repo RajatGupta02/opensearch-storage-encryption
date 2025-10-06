@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+env:
+  GRADLE_OPTS: -Dhttp.keepAlive=false
+
+jobs:
+  Get-CI-Image-Tag:
+    uses: opensearch-project/opensearch-build/.github/workflows/get-ci-image-tag.yml@main
+    with:
+      product: opensearch
+
+  build-linux:
+    name: build
+    needs: ["Get-CI-Image-Tag"]
+    strategy:
+      fail-fast: false
+      matrix:
+        jdk: [21, 24]
+        platform: [ubuntu-latest]
+    runs-on: ubuntu-latest
+    container:
+      # using the same image which is used by opensearch-build to build the OpenSearch Distribution
+      # this image tag is subject to change as more dependencies and updates will arrive over time
+      image: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-version-linux }}
+      # need to switch to root so that github actions can install runner binary on container without permission issues.
+      options: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-start-options }}
+    
+    steps:
+      - name: Run start commands
+        run: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-start-command }}
+      
+      - name: Set up JDK for build and test
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin # Temurin is a distribution of adoptium
+          java-version: ${{ matrix.jdk }}
+      
+      - name: Checkout storage-encryption
+        uses: actions/checkout@v5
+      
+      - name: Build with Gradle
+        uses: gradle/gradle-build-action@v3
+        with:
+          cache-disabled: true
+          arguments: |
+            assemble -Dbuild.snapshot=false
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ matrix.platform }}-JDK${{ matrix.jdk }}-build-reports
+          path: |
+            ./build/reports/
+            ./build/distributions/
