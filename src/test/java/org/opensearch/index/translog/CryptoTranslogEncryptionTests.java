@@ -42,6 +42,7 @@ public class CryptoTranslogEncryptionTests extends OpenSearchTestCase {
     /**
      * Helper method to register the resolver in the IndexKeyResolverRegistry
      */
+    @SuppressForbidden(reason = "Test needs to register mock resolver in IndexKeyResolverRegistry")
     private void registerResolver(String indexUuid, KeyIvResolver resolver) throws Exception {
         Field resolverCacheField = IndexKeyResolverRegistry.class.getDeclaredField("resolverCache");
         resolverCacheField.setAccessible(true);
