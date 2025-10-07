@@ -55,12 +55,12 @@ jobs:
           arguments: |
             assemble -Dbuild.snapshot=false
       
-      - name: Run checks and tests
-        uses: gradle/gradle-build-action@v3
-        with:
-          cache-disabled: true
-          arguments: |
-            check -x internalClusterTest -Dbuild.snapshot=false
+      - name: Switch to ci-runner user and run tests
+        run: |
+          chown -R ci-runner:ci-runner $GITHUB_WORKSPACE
+          chmod -R 755 $GITHUB_WORKSPACE
+          # Preserve environment variables when switching users
+          su ci-runner -c "export JAVA_HOME=$JAVA_HOME && export GRADLE_OPTS='$GRADLE_OPTS' && cd $GITHUB_WORKSPACE && ./gradlew check -x internalClusterTest -Dbuild.snapshot=false"
       
       - name: Publish Test Results
         uses: dorny/test-reporter@v1
