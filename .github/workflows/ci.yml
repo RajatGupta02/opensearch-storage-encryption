@@ -49,7 +49,14 @@ jobs:
         with:
           cache-disabled: true
           arguments: |
-            assemble spotlessCheck -Dbuild.snapshot=false
+            assemble -Dbuild.snapshot=false
+      
+      - name: Run checks and tests
+        uses: gradle/gradle-build-action@v3
+        with:
+          cache-disabled: true
+          arguments: |
+            check -x internalClusterTest -Dbuild.snapshot=false
       
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -79,8 +86,8 @@ jobs:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.KMS_REGION }}
 
       - name: Checkout OpenSearch
         uses: actions/checkout@v5
@@ -130,11 +137,11 @@ jobs:
       - name: Configure OpenSearch and Run Tests
         working-directory: ./opensearch
         env:
-          AWS_KMS_KEY_ARN: ${{ secrets.AWS_KMS_KEY_ARN }}
+          KMS_KEY_ARN: ${{ secrets.KMS_KEY_ARN }}
         run: |
           # Configure opensearch.yml with KMS settings
-          echo "kms.region: ${{ secrets.AWS_REGION }}" >> config/opensearch.yml
-          echo "kms.key_arn: ${{ secrets.AWS_KMS_KEY_ARN }}" >> config/opensearch.yml
+          echo "kms.region: ${{ secrets.KMS_REGION }}" >> config/opensearch.yml
+          echo "kms.key_arn: ${{ secrets.KMS_KEY_ARN }}" >> config/opensearch.yml
 
           # Configure OpenSearch keystore
           echo "Configuring OpenSearch keystore"
