@@ -64,6 +64,10 @@ jobs:
           # Preserve environment variables when switching users
           su ci-runner -c "export JAVA_HOME=$JAVA_HOME && export GRADLE_OPTS='$GRADLE_OPTS' && cd $GITHUB_WORKSPACE && ./gradlew check -x internalClusterTest -Dbuild.snapshot=false"
       
+      - name: Configure git for test reporter
+        if: always()
+        run: git config --global --add safe.directory $GITHUB_WORKSPACE
+      
       - name: Publish Test Results
         uses: dorny/test-reporter@v1
         if: always()
