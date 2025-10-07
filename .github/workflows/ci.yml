@@ -24,6 +24,10 @@ jobs:
         jdk: [24]
         platform: [ubuntu-latest]
     runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      pull-requests: write
+      contents: read
     container:
       # using the same image which is used by opensearch-build to build the OpenSearch Distribution
       # this image tag is subject to change as more dependencies and updates will arrive over time
@@ -57,6 +61,15 @@ jobs:
           cache-disabled: true
           arguments: |
             check -x internalClusterTest -Dbuild.snapshot=false
+      
+      - name: Publish Test Results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Test Results
+          path: 'build/test-results/test/TEST-*.xml'
+          reporter: java-junit
+          fail-on-error: false
       
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
