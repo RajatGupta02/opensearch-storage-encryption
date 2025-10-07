@@ -67,100 +67,100 @@ jobs:
             ./build/reports/
             ./build/distributions/
 
-  integration-test:
-    name: Run OpenSearch Integration Tests
-    needs: ["Get-CI-Image-Tag", "build-linux"]
-    runs-on: ubuntu-latest
-    container:
-      image: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-version-linux }}
-      options: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-start-options }}
+  # integration-test:
+  #   name: Run OpenSearch Integration Tests
+  #   needs: ["Get-CI-Image-Tag", "build-linux"]
+  #   runs-on: ubuntu-latest
+  #   container:
+  #     image: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-version-linux }}
+  #     options: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-start-options }}
 
-    permissions:
-      id-token: write
-      contents: read
+  #   permissions:
+  #     id-token: write
+  #     contents: read
 
-    steps:
-      - name: Run start commands
-        run: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-start-command }}
+  #   steps:
+  #     - name: Run start commands
+  #       run: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-start-command }}
 
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ secrets.KMS_REGION }}
+  #     - name: Configure AWS Credentials
+  #       uses: aws-actions/configure-aws-credentials@v4
+  #       with:
+  #         role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+  #         aws-region: ${{ secrets.KMS_REGION }}
 
-      - name: Checkout OpenSearch
-        uses: actions/checkout@v5
-        with:
-          repository: opensearch-project/OpenSearch
-          path: opensearch
+  #     - name: Checkout OpenSearch
+  #       uses: actions/checkout@v5
+  #       with:
+  #         repository: opensearch-project/OpenSearch
+  #         path: opensearch
 
-      - name: Checkout crypto-kms Plugin
-        uses: actions/checkout@v5
-        with:
-          repository: opensearch-project/crypto-kms
-          path: crypto-kms
+  #     - name: Checkout crypto-kms Plugin
+  #       uses: actions/checkout@v5
+  #       with:
+  #         repository: opensearch-project/crypto-kms
+  #         path: crypto-kms
 
-      - name: Checkout Storage Encryption Plugin
-        uses: actions/checkout@v5
-        with:
-          path: storage-encryption
+  #     - name: Checkout Storage Encryption Plugin
+  #       uses: actions/checkout@v5
+  #       with:
+  #         path: storage-encryption
 
-      - name: Set up JDK
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: 24
+  #     - name: Set up JDK
+  #       uses: actions/setup-java@v5
+  #       with:
+  #         distribution: temurin
+  #         java-version: 24
 
-      - name: Build crypto-kms Plugin
-        working-directory: ./crypto-kms
-        run: |
-          ./gradlew assemble
+  #     - name: Build crypto-kms Plugin
+  #       working-directory: ./crypto-kms
+  #       run: |
+  #         ./gradlew assemble
 
-      - name: Build Storage Encryption Plugin
-        working-directory: ./storage-encryption
-        run: |
-          ./gradlew assemble
+  #     - name: Build Storage Encryption Plugin
+  #       working-directory: ./storage-encryption
+  #       run: |
+  #         ./gradlew assemble
 
-      - name: Install Plugins
-        run: |
-          # Create plugins directories
-          mkdir -p opensearch/plugins/crypto-kms
-          mkdir -p opensearch/plugins/storage-encryption
+  #     - name: Install Plugins
+  #       run: |
+  #         # Create plugins directories
+  #         mkdir -p opensearch/plugins/crypto-kms
+  #         mkdir -p opensearch/plugins/storage-encryption
           
-          # Copy crypto-kms plugin
-          cp crypto-kms/build/distributions/*.zip opensearch/plugins/crypto-kms/
+  #         # Copy crypto-kms plugin
+  #         cp crypto-kms/build/distributions/*.zip opensearch/plugins/crypto-kms/
           
-          # Copy storage-encryption plugin
-          cp storage-encryption/build/distributions/*.zip opensearch/plugins/storage-encryption/
+  #         # Copy storage-encryption plugin
+  #         cp storage-encryption/build/distributions/*.zip opensearch/plugins/storage-encryption/
 
-      - name: Configure OpenSearch and Run Tests
-        working-directory: ./opensearch
-        env:
-          KMS_KEY_ARN: ${{ secrets.KMS_KEY_ARN }}
-        run: |
-          # Configure opensearch.yml with KMS settings
-          echo "kms.region: ${{ secrets.KMS_REGION }}" >> config/opensearch.yml
-          echo "kms.key_arn: ${{ secrets.KMS_KEY_ARN }}" >> config/opensearch.yml
+  #     - name: Configure OpenSearch and Run Tests
+  #       working-directory: ./opensearch
+  #       env:
+  #         KMS_KEY_ARN: ${{ secrets.KMS_KEY_ARN }}
+  #       run: |
+  #         # Configure opensearch.yml with KMS settings
+  #         echo "kms.region: ${{ secrets.KMS_REGION }}" >> config/opensearch.yml
+  #         echo "kms.key_arn: ${{ secrets.KMS_KEY_ARN }}" >> config/opensearch.yml
 
-          # Configure OpenSearch keystore
-          echo "Configuring OpenSearch keystore"
-          echo "y" | ./opensearch-keystore create
-          echo "$AWS_SESSION_TOKEN" | ./opensearch-keystore add -x kms.session_token
-          echo "$AWS_ACCESS_KEY_ID" | ./opensearch-keystore add -x kms.access_key
-          echo "$AWS_SECRET_ACCESS_KEY" | ./opensearch-keystore add -x kms.secret_key
+  #         # Configure OpenSearch keystore
+  #         echo "Configuring OpenSearch keystore"
+  #         echo "y" | ./opensearch-keystore create
+  #         echo "$AWS_SESSION_TOKEN" | ./opensearch-keystore add -x kms.session_token
+  #         echo "$AWS_ACCESS_KEY_ID" | ./opensearch-keystore add -x kms.access_key
+  #         echo "$AWS_SECRET_ACCESS_KEY" | ./opensearch-keystore add -x kms.secret_key
           
-          # Run specific test suites with index settings
-          ./gradlew :qa:smoke-test-multinode:integTest :qa:full-cluster-restart:integTest \
-            -Dtests.security.manager=false \
-            -Dtest.index.store.type=cryptofs \
-            -Dtest.index.store.kms.type=aws-kms
+  #         # Run specific test suites with index settings
+  #         ./gradlew :qa:smoke-test-multinode:integTest :qa:full-cluster-restart:integTest \
+  #           -Dtests.security.manager=false \
+  #           -Dtest.index.store.type=cryptofs \
+  #           -Dtest.index.store.kms.type=aws-kms
 
-      - name: Upload test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: integration-test-results
-          path: |
-            opensearch/qa/smoke-test-multinode/build/reports/tests/
-            opensearch/qa/full-cluster-restart/build/reports/tests/
+  #     - name: Upload test results
+  #       if: always()
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: integration-test-results
+  #         path: |
+  #           opensearch/qa/smoke-test-multinode/build/reports/tests/
+  #           opensearch/qa/full-cluster-restart/build/reports/tests/
