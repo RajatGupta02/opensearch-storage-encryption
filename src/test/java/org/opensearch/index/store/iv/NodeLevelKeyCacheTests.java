@@ -8,7 +8,6 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
-import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -30,9 +29,11 @@ import org.junit.Test;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.SuppressForbidden;
 import org.opensearch.index.store.CryptoDirectoryFactory;
+import org.opensearch.test.OpenSearchTestCase;
 
-public class NodeLevelKeyCacheTests {
+public class NodeLevelKeyCacheTests extends OpenSearchTestCase {
 
     @Mock
     private DefaultKeyIvResolver mockResolver;
@@ -43,6 +44,7 @@ public class NodeLevelKeyCacheTests {
 
     @Before
     public void setUp() throws Exception {
+        super.setUp();
         MockitoAnnotations.openMocks(this);
 
         // Create test keys
@@ -61,15 +63,17 @@ public class NodeLevelKeyCacheTests {
     }
 
     @After
-    public void tearDown() {
+    public void tearDown() throws Exception {
         // Clean up after each test
         NodeLevelKeyCache.reset();
         IndexKeyResolverRegistry.clearCache();
+        super.tearDown();
     }
 
     /**
      * Helper method to register a mock resolver in the IndexKeyResolverRegistry
      */
+    @SuppressForbidden(reason = "Test needs to register mock resolver in IndexKeyResolverRegistry")
     private void registerMockResolver(String indexUuid) throws Exception {
         Field resolverCacheField = IndexKeyResolverRegistry.class.getDeclaredField("resolverCache");
         resolverCacheField.setAccessible(true);
@@ -78,7 +82,6 @@ public class NodeLevelKeyCacheTests {
         resolverCache.put(indexUuid, mockResolver);
     }
 
-    @Test
     public void testInitialization() {
         Settings settings = Settings.builder().put("node.store.data_key_ttl_seconds", 60).build();
 
@@ -87,12 +90,12 @@ public class NodeLevelKeyCacheTests {
         assertNotNull(NodeLevelKeyCache.getInstance());
     }
 
-    @Test(expected = IllegalStateException.class)
     public void testGetInstanceWithoutInitialization() {
-        NodeLevelKeyCache.getInstance();
+        expectThrows(IllegalStateException.class, () -> {
+            NodeLevelKeyCache.getInstance();
+        });
     }
 
-    @Test
     public void testInitialKeyLoad() throws Exception {
         Settings settings = Settings.EMPTY;
         NodeLevelKeyCache.initialize(settings);
@@ -107,7 +110,6 @@ public class NodeLevelKeyCacheTests {
         verify(mockResolver, times(1)).loadKeyFromMasterKeyProvider();
     }
 
-    @Test
     public void testInitialKeyLoadFailure() throws Exception {
         when(mockResolver.loadKeyFromMasterKeyProvider())
             .thenThrow(new RuntimeException("KMS unavailable"));
@@ -131,7 +133,6 @@ public class NodeLevelKeyCacheTests {
         assertTrue(thrown.getMessage().contains("KMS unavailable"));
     }
 
-    @Test
     public void testCacheHit() throws Exception {
         Settings settings = Settings.EMPTY;
         NodeLevelKeyCache.initialize(settings);
@@ -150,7 +151,6 @@ public class NodeLevelKeyCacheTests {
         verify(mockResolver, times(1)).loadKeyFromMasterKeyProvider();
     }
 
-    @Test
     public void testRefreshSuccess() throws Exception {
         // Use a very short TTL for testing
         Settings settings = Settings.builder().put("node.store.data_key_ttl_seconds", 1).build();
@@ -182,10 +182,9 @@ public class NodeLevelKeyCacheTests {
         Key refreshedKey = cache.get(TEST_INDEX_UUID);
         assertEquals(testKey2, refreshedKey);
 
-        verify(mockResolver, atLeast(2)).loadKeyFromMasterKeyProvider();
+        verify(mockResolver, org.mockito.Mockito.atLeast(2)).loadKeyFromMasterKeyProvider();
     }
 
-    @Test
     public void testRefreshFailureReturnsOldKey() throws Exception {
         // Use a very short TTL for testing
         Settings settings = Settings.builder().put("node.store.data_key_ttl_seconds", 1).build();
@@ -214,7 +213,6 @@ public class NodeLevelKeyCacheTests {
         verify(mockResolver, times(2)).loadKeyFromMasterKeyProvider();
     }
 
-    @Test
     public void testMultipleRefreshFailures() throws Exception {
         // Use a very short TTL for testing
         Settings settings = Settings.builder().put("node.store.data_key_ttl_seconds", 1).build();
@@ -242,10 +240,9 @@ public class NodeLevelKeyCacheTests {
             assertEquals(testKey1, key); // Should always return original key
         }
 
-        verify(mockResolver, atLeast(3)).loadKeyFromMasterKeyProvider();
+        verify(mockResolver, org.mockito.Mockito.atLeast(3)).loadKeyFromMasterKeyProvider();
     }
 
-    @Test
     public void testEviction() throws Exception {
         Settings settings = Settings.EMPTY;
         NodeLevelKeyCache.initialize(settings);
@@ -268,7 +265,6 @@ public class NodeLevelKeyCacheTests {
         verify(mockResolver, times(2)).loadKeyFromMasterKeyProvider();
     }
 
-    @Test
     public void testSize() throws Exception {
         Settings settings = Settings.EMPTY;
         NodeLevelKeyCache.initialize(settings);
@@ -287,7 +283,6 @@ public class NodeLevelKeyCacheTests {
         assertEquals(2, cache.size());
     }
 
-    @Test
     public void testClear() throws Exception {
         Settings settings = Settings.EMPTY;
         NodeLevelKeyCache.initialize(settings);
@@ -305,7 +300,6 @@ public class NodeLevelKeyCacheTests {
         assertEquals(0, cache.size());
     }
 
-    @Test
     public void testReset() throws Exception {
         Settings settings = Settings.EMPTY;
         NodeLevelKeyCache.initialize(settings);
@@ -324,7 +318,6 @@ public class NodeLevelKeyCacheTests {
         assertNotNull(thrown);
     }
 
-    @Test
     public void testConcurrentAccess() throws Exception {
         final AtomicInteger loadCount = new AtomicInteger(0);
 
@@ -365,7 +358,6 @@ public class NodeLevelKeyCacheTests {
         assertEquals(1, loadCount.get());
     }
 
-    @Test
     public void testNullParameters() throws Exception {
         Settings settings = Settings.EMPTY;
         NodeLevelKeyCache.initialize(settings);
@@ -392,7 +384,6 @@ public class NodeLevelKeyCacheTests {
         assertTrue(thrown.getMessage().contains("indexUuid cannot be null"));
     }
 
-    @Test
     public void testDefaultTTLValue() {
         // Test default TTL when not specified
         Settings settings = Settings.EMPTY;
@@ -402,7 +393,6 @@ public class NodeLevelKeyCacheTests {
         assertNotNull(NodeLevelKeyCache.getInstance());
     }
 
-    @Test
     public void testCacheWithRefreshDisabled() throws Exception {
         when(mockResolver.loadKeyFromMasterKeyProvider())
             .thenReturn(testKey1)  // Initial load
@@ -431,7 +421,6 @@ public class NodeLevelKeyCacheTests {
         verify(mockResolver, times(1)).loadKeyFromMasterKeyProvider();
     }
 
-    @Test
     public void testInvalidTTLValues() {
         // Test that 0 is rejected
         Settings settings = Settings.builder().put("node.store.data_key_ttl_seconds", 0).build();
