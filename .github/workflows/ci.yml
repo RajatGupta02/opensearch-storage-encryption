@@ -5,6 +5,7 @@ on:
     branches:
       - main
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 env:
   GRADLE_OPTS: -Dhttp.keepAlive=false
@@ -16,7 +17,7 @@ jobs:
       product: opensearch
 
   build-linux:
-    name: Gradle assemble and spotless check
+    name: Linux - Gradle check
     needs: ["Get-CI-Image-Tag"]
     strategy:
       fail-fast: false
@@ -29,10 +30,7 @@ jobs:
       pull-requests: write
       contents: read
     container:
-      # using the same image which is used by opensearch-build to build the OpenSearch Distribution
-      # this image tag is subject to change as more dependencies and updates will arrive over time
       image: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-version-linux }}
-      # need to switch to root so that github actions can install runner binary on container without permission issues.
       options: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-start-options }}
     
     steps:
@@ -47,6 +45,8 @@ jobs:
       
       - name: Checkout opensearch-storage-encryption
         uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
       
       - name: Build with Gradle
         uses: gradle/gradle-build-action@v3
@@ -63,20 +63,16 @@ jobs:
           chmod +x $GITHUB_WORKSPACE/gradlew
           # Preserve environment variables when switching users
           su ci-runner -c "export JAVA_HOME=$JAVA_HOME && export GRADLE_OPTS='$GRADLE_OPTS' && cd $GITHUB_WORKSPACE && ./gradlew check -x internalClusterTest -Dbuild.snapshot=false"
-      
-      - name: Fix test results ownership
-        if: always()
-        run: chown -R root:root $GITHUB_WORKSPACE/build/test-results/ || true
-      
+
       - name: Configure git for test reporter
         if: always()
         run: git config --global --add safe.directory $GITHUB_WORKSPACE
       
-      - name: Publish Test Results
+      - name: Publish Test Results (Linux)
         uses: dorny/test-reporter@v1
         if: always()
         with:
-          name: Test Results
+          name: Test Results - Linux JDK${{ matrix.jdk }}
           path: 'build/test-results/test/TEST-*.xml'
           reporter: java-junit
           fail-on-error: false
@@ -85,7 +81,113 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ${{ matrix.platform }}-JDK${{ matrix.jdk }}-build-reports
+          name: linux-JDK${{ matrix.jdk }}-build-reports
+          path: |
+            ./build/reports/
+            ./build/distributions/
+
+  build-macos:
+    name: macOS - Gradle check
+    strategy:
+      fail-fast: false
+      matrix:
+        jdk: [24]
+    runs-on: macos-latest
+    permissions:
+      checks: write
+      pull-requests: write
+      contents: read
+    
+    steps:
+      - name: Set up JDK for build and test
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin # Temurin is a distribution of adoptium
+          java-version: ${{ matrix.jdk }}
+      
+      - name: Checkout opensearch-storage-encryption
+        uses: actions/checkout@v5
+      
+      - name: Build with Gradle
+        uses: gradle/gradle-build-action@v3
+        with:
+          cache-disabled: true
+          arguments: |
+            assemble -Dbuild.snapshot=false
+      
+      - name: Run tests
+        uses: gradle/gradle-build-action@v3
+        with:
+          cache-disabled: true
+          arguments: check -x internalClusterTest -Dbuild.snapshot=false
+
+      - name: Publish Test Results (macOS)
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Test Results - macOS JDK${{ matrix.jdk }}
+          path: 'build/test-results/test/TEST-*.xml'
+          reporter: java-junit
+          fail-on-error: false
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-JDK${{ matrix.jdk }}-build-reports
+          path: |
+            ./build/reports/
+            ./build/distributions/
+
+  build-windows:
+    name: Windows - Gradle check
+    strategy:
+      fail-fast: false
+      matrix:
+        jdk: [24]
+    runs-on: windows-latest
+    permissions:
+      checks: write
+      pull-requests: write
+      contents: read
+    
+    steps:
+      - name: Set up JDK for build and test
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin # Temurin is a distribution of adoptium
+          java-version: ${{ matrix.jdk }}
+      
+      - name: Checkout opensearch-storage-encryption
+        uses: actions/checkout@v5
+      
+      - name: Build with Gradle
+        uses: gradle/gradle-build-action@v3
+        with:
+          cache-disabled: true
+          arguments: |
+            assemble -Dbuild.snapshot=false
+      
+      - name: Run tests
+        uses: gradle/gradle-build-action@v3
+        with:
+          cache-disabled: true
+          arguments: check -x internalClusterTest -Dbuild.snapshot=false
+      
+      - name: Publish Test Results (Windows)
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Test Results - Windows JDK${{ matrix.jdk }}
+          path: 'build/test-results/test/TEST-*.xml'
+          reporter: java-junit
+          fail-on-error: false
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-JDK${{ matrix.jdk }}-build-reports
           path: |
             ./build/reports/
             ./build/distributions/
