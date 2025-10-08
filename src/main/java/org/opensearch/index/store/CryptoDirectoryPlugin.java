@@ -12,8 +12,12 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.function.Supplier;
 
+import org.opensearch.cluster.metadata.CryptoMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.Randomness;
+import org.opensearch.common.crypto.DataKeyPair;
+import org.opensearch.common.crypto.MasterKeyProvider;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
@@ -28,6 +32,7 @@ import org.opensearch.index.shard.IndexEventListener;
 import org.opensearch.index.store.iv.IndexKeyResolverRegistry;
 import org.opensearch.index.store.iv.NodeLevelKeyCache;
 import org.opensearch.indices.cluster.IndicesClusterStateService.AllocatedIndices.IndexRemovalReason;
+import org.opensearch.plugins.CryptoKeyProviderPlugin;
 import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.plugins.Plugin;
@@ -40,7 +45,7 @@ import org.opensearch.watcher.ResourceWatcherService;
 /**
  * A plugin that enables index level encryption and decryption.
  */
-public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, EnginePlugin {
+public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, EnginePlugin, CryptoKeyProviderPlugin {
 
     /**
      * The default constructor.
@@ -116,6 +121,47 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
                 }
             });
         }
+    }
+
+    @Override
+    public MasterKeyProvider createKeyProvider(CryptoMetadata cryptoMetadata) {
+        return new MasterKeyProvider() {
+            @Override
+            public DataKeyPair generateDataPair() {
+                byte[] rawKey = new byte[32];
+                byte[] encryptedKey = new byte[32];
+                java.util.Random rnd = Randomness.get();
+                rnd.nextBytes(rawKey);
+                rnd.nextBytes(encryptedKey);
+                return new DataKeyPair(rawKey, encryptedKey);
+            }
+
+            @Override
+            public byte[] decryptKey(byte[] encryptedKey) {
+                // For mock/testing purposes, just return the input as-is
+                return encryptedKey;
+            }
+
+            @Override
+            public String getKeyId() {
+                return "builtin-mock-key-id";
+            }
+
+            @Override
+            public Map<String, String> getEncryptionContext() {
+                return Collections.emptyMap();
+            }
+
+            @Override
+            public void close() {
+                // Nothing to close for mock implementation
+            }
+        };
+    }
+
+    @Override
+    public String type() {
+        return "dummy";
     }
 
 }
