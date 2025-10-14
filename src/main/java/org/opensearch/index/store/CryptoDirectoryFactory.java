@@ -327,12 +327,12 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
                         );
                     sharedSegmentPool.warmUp((long) (maxBlocks * WARM_UP_PERCENTAGE));
 
-                    @SuppressWarnings("resource")
-                    ThreadPoolExecutor removalExec = new ThreadPoolExecutor(4, 8, 60L, TimeUnit.SECONDS, new LinkedBlockingQueue<>(), r -> {
-                        Thread t = new Thread(r, "block-cache-maint");
-                        t.setDaemon(true);
-                        return t;
-                    });
+                    // @SuppressWarnings("resource")
+                    // ThreadPoolExecutor removalExec = new ThreadPoolExecutor(4, 8, 60L, TimeUnit.SECONDS, new LinkedBlockingQueue<>(), r -> {
+                    //     Thread t = new Thread(r, "block-cache-maint");
+                    //     t.setDaemon(true);
+                    //     return t;
+                    // });
 
                     // Initialize shared cache with removal listener
                     Cache<BlockCacheKey, BlockCacheValue<RefCountedMemorySegment>> cache = Caffeine
@@ -342,13 +342,12 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
                         .maximumSize(maxBlocks)
                         .removalListener((BlockCacheKey key, BlockCacheValue<RefCountedMemorySegment> value, RemovalCause cause) -> {
                             if (value != null) {
-                                removalExec.execute(() -> {
                                     try {
                                         value.close();
                                     } catch (Throwable t) {
                                         LOGGER.warn("Failed to close cached value during removal {}", key, t);
                                     }
-                                });
+                            
                             }
                         })
                         .build();
@@ -357,7 +356,7 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
 
                     LOGGER.info("Creating shared block cache with maxSize={}, poolSize={}", maxBlocks, maxBlocks);
 
-                    startTelemetry();
+                    // startTelemetry();
                 }
             }
         }

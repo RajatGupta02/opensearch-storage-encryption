@@ -22,6 +22,7 @@ import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
 import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexService;
+import org.opensearch.core.index.Index;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.shard.IndexEventListener;
@@ -77,6 +78,13 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
     public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings) {
         // Only provide our custom engine factory for cryptofs indices
         if ("cryptofs".equals(indexSettings.getValue(IndexModule.INDEX_STORE_TYPE_SETTING))) {
+
+            boolean isTestEnvironment = indexSettings.getNodeSettings().getAsBoolean("tests.integration", false) ||
+                            indexSettings.getNodeSettings().getAsBoolean("tests.cluster", false);
+
+            if(isTestEnvironment) {
+                return Optional.empty();
+            }
             return Optional.of(new CryptoEngineFactory());
         }
         return Optional.empty();
@@ -110,8 +118,8 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
         if ("cryptofs".equals(storeType)) {
             indexModule.addIndexEventListener(new IndexEventListener() {
                 @Override
-                public void beforeIndexRemoved(IndexService indexService, IndexRemovalReason reason) {
-                    String indexUuid = indexService.index().getUUID();
+                public void afterIndexRemoved(Index index, IndexSettings indexSettings, IndexRemovalReason reason) {
+                    String indexUuid = index.getUUID();
                     IndexKeyResolverRegistry.removeResolver(indexUuid);
                 }
             });
