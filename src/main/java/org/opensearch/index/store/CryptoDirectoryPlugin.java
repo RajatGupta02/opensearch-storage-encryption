@@ -78,13 +78,6 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
     public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings) {
         // Only provide our custom engine factory for cryptofs indices
         if ("cryptofs".equals(indexSettings.getValue(IndexModule.INDEX_STORE_TYPE_SETTING))) {
-
-            boolean isTestEnvironment = indexSettings.getNodeSettings().getAsBoolean("tests.integration", false) ||
-                            indexSettings.getNodeSettings().getAsBoolean("tests.cluster", false);
-
-            if(isTestEnvironment) {
-                return Optional.empty();
-            }
             return Optional.of(new CryptoEngineFactory());
         }
         return Optional.empty();
