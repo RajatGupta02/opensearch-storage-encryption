@@ -65,6 +65,8 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
                 CryptoDirectoryFactory.INDEX_KMS_ARN_SETTING,
                 CryptoDirectoryFactory.INDEX_KMS_ENC_CTX_SETTING,
                 CryptoDirectoryFactory.NODE_KEY_REFRESH_INTERVAL_SECS_SETTING,
+                CryptoDirectoryFactory.NODE_KEY_EXPIRY_MULTIPLIER_SETTING,
+                CryptoDirectoryFactory.NODE_KEY_RETRY_INTERVAL_SECS_SETTING,
                 PoolSizeCalculator.NODE_POOL_SIZE_PERCENTAGE_SETTING,
                 PoolSizeCalculator.NODE_POOL_TO_CACHE_RATIO_SETTING,
                 PoolSizeCalculator.NODE_WARMUP_PERCENTAGE_SETTING
