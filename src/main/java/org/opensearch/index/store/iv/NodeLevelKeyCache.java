@@ -7,7 +7,10 @@ package org.opensearch.index.store.iv;
 import java.security.Key;
 import java.util.Objects;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -19,10 +22,19 @@ import com.github.benmanes.caffeine.cache.LoadingCache;
 
 /**
  * Node-level cache for encryption keys used across all indices.
- * Provides centralized key management with global TTL configuration.
+ * Provides centralized key management with global TTL configuration and failure handling.
  * 
  * This cache replaces the per-resolver Caffeine caches to reduce memory overhead
  * and provide better cache utilization across indices.
+ * 
+ * <p>Failure Handling Strategy:
+ * <ul>
+ *   <li>Keys are refreshed in background at TTL intervals (default: 1 hour)</li>
+ *   <li>On refresh failure, old key is retained temporarily</li>
+ *   <li>After multiple consecutive failures (default: 3), keys expire</li>
+ *   <li>Load retries are throttled to prevent DOS (default: 5 minutes between attempts)</li>
+ *   <li>System automatically recovers when Master Key Provider is restored</li>
+ * </ul>
  * 
  * @opensearch.internal
  */
@@ -34,6 +46,33 @@ public class NodeLevelKeyCache {
 
     private final LoadingCache<CacheKey, Key> keyCache;
     private final long globalTtlSeconds;
+    private final int expiryMultiplier;
+    private final long retryIntervalSeconds;
+
+    // Track failures per index to implement DOS protection and retry throttling
+    private final ConcurrentHashMap<String, FailureState> failureTracker;
+
+    /**
+     * Tracks failure state for an index to implement retry throttling.
+     */
+    static class FailureState {
+        final AtomicLong lastFailureTimeMillis;
+        final AtomicReference<Exception> lastException;
+
+        FailureState(Exception exception) {
+            this.lastFailureTimeMillis = new AtomicLong(System.currentTimeMillis());
+            this.lastException = new AtomicReference<>(exception);
+        }
+
+        void recordFailure(Exception exception) {
+            lastFailureTimeMillis.set(System.currentTimeMillis());
+            lastException.set(exception);
+        }
+
+        long getSecondsSinceLastFailure() {
+            return (System.currentTimeMillis() - lastFailureTimeMillis.get()) / 1000;
+        }
+    }
 
     /**
      * Cache key that contains the index UUID and resolver.
@@ -85,13 +124,21 @@ public class NodeLevelKeyCache {
     public static synchronized void initialize(Settings nodeSettings) {
         if (INSTANCE == null) {
             int globalTtlSeconds = nodeSettings.getAsInt("node.store.data_key_ttl_seconds", 3600);
+            int expiryMultiplier = nodeSettings.getAsInt("node.store.data_key_expiry_multiplier", 3);
+            int retryIntervalSeconds = nodeSettings.getAsInt("node.store.data_key_retry_interval_seconds", 300);
 
-            INSTANCE = new NodeLevelKeyCache((long) globalTtlSeconds);
+            INSTANCE = new NodeLevelKeyCache((long) globalTtlSeconds, expiryMultiplier, (long) retryIntervalSeconds);
 
             if (globalTtlSeconds == -1) {
-                logger.debug("Initialized NodeLevelKeyCache with refresh disabled (TTL: -1)");
+                logger.info("Initialized NodeLevelKeyCache with refresh disabled (TTL: -1)");
             } else {
-                logger.debug("Initialized NodeLevelKeyCache with global TTL: {} seconds", globalTtlSeconds);
+                logger
+                    .info(
+                        "Initialized NodeLevelKeyCache with refresh TTL: {} seconds, expiry multiplier: {}, retry interval: {} seconds",
+                        globalTtlSeconds,
+                        expiryMultiplier,
+                        retryIntervalSeconds
+                    );
             }
         }
     }
@@ -110,50 +157,37 @@ public class NodeLevelKeyCache {
     }
 
     /**
-     * Constructs the cache with global TTL configuration.
+     * Constructs the cache with global TTL and expiration configuration.
      * <p>
-     * This implements a non-expiring cache with asynchronous refresh semantics:
+     * This implements a cache with asynchronous refresh and failure-based expiration:
      * <ul>
-     *  <li> When a key is first requested, it is loaded synchronously from the MasterKey Provider.
+     *  <li>When a key is first requested, it is loaded synchronously from the MasterKey Provider.</li>
      * 
-     *  <li> After the key has been in the cache for the configured TTL duration, 
-     *    the next access will trigger an asynchronous reload in the background.
+     *  <li>After the key has been in the cache for the refresh TTL duration, 
+     *      the next access triggers an asynchronous reload in the background.</li>
      * 
-     *  <li> While the reload is in progress, it continues to return the 
-     *   previously cached (stale) value to avoid blocking operations.
+     *  <li>While the reload is in progress, it continues to return the 
+     *      previously cached (stale) value to avoid blocking operations.</li>
      * 
-     *  <li> If the reload fails due to any exception (e.g., MasterKeyProvider unavailable), 
-     *   the cache retains and continues to serve the old value instead of 
-     *   evicting it, ensuring operations can continue with the last known good key.
+     *  <li>If the reload fails, an exception is thrown (not suppressed), allowing Caffeine to track failures.</li>
+     * 
+     *  <li>After consecutive failures for the expiry duration (refreshTTL * expiryMultiplier),
+     *      the entry is evicted from the cache.</li>
+     * 
+     *  <li>Load attempts are throttled with a minimum retry interval to prevent DOS on Master Key Provider.</li>
+     * 
+     *  <li>When Master Key Provider is restored, the next get() will trigger a fresh load and recover automatically.</li>
      * </ul>
-     * @param globalTtlSeconds the global TTL in seconds (-1 means never refresh)
-    
+     * 
+     * @param globalTtlSeconds the refresh TTL in seconds (-1 means never refresh)
+     * @param expiryMultiplier multiplier for expiration (expiryTime = refreshTTL * multiplier)
+     * @param retryIntervalSeconds minimum seconds between load retry attempts
      */
-    /* 
-     * Future Enhancement: Stricter Failed Refresh Model
-     * In the next iteration of PRs, when we move toward stricter model of failed reloads,
-     * we could introduce a cache policy using refreshAfterWrite(X) plus expireAfterWrite(Y)
-     * where Y > X and Y = nX (maybe Y = 3X).
-     * 
-     * With this approach:
-     *   - The cache will continue to serve the existing resolver for some failures
-     *   - If refreshes have failed across Y consecutive intervals (i.e., the key being revoked),
-     *       the entry will be auto-evicted
-     *   - At eviction time, we could also mutate the associated resolver instance to null or 
-     *       a dummy value (sentinel), ensuring that any new access on this dummy resolver from 
-     *       index input and output fails and consults the cache, triggering a load
-     *   - This prevents us from building any background task
-     *   - One more advantage is we prevent any unnecessary checks if customer has stopped 
-     *       sending traffic
-     * 
-     * 
-     * DOS Protection: We have to be careful that too many loads (DOS) on a failed key may DOS the cache. 
-     * Hence, we should only attempt a load from cache if the last attempt for a resolver failed 
-     * for more than X minutes.
-     * 
-     */
-    private NodeLevelKeyCache(long globalTtlSeconds) {
+    private NodeLevelKeyCache(long globalTtlSeconds, int expiryMultiplier, long retryIntervalSeconds) {
         this.globalTtlSeconds = globalTtlSeconds;
+        this.expiryMultiplier = expiryMultiplier;
+        this.retryIntervalSeconds = retryIntervalSeconds;
+        this.failureTracker = new ConcurrentHashMap<>();
 
         // Check if refresh is disabled
         if (globalTtlSeconds == -1L) {
@@ -164,52 +198,100 @@ public class NodeLevelKeyCache {
                 .build(new CacheLoader<CacheKey, Key>() {
                     @Override
                     public Key load(CacheKey key) throws Exception {
-                        // Use the resolver provided in the cache key - eliminates registry lookup race condition
-                        if (key.resolver == null) {
-                            throw new IllegalStateException("Resolver not provided for index: " + key.indexUuid);
-                        }
-                        return key.resolver.loadKeyFromMasterKeyProvider();
+                        return loadKeyWithThrottling(key);
                     }
                     // No reload method needed since refresh is disabled
                 });
         } else {
-            // Create cache with refresh-only policy (no expiry)
+            // Create cache with refresh and expiration policy
+            // Keys refresh at TTL intervals, expire after TTL * multiplier on consecutive failures
             this.keyCache = Caffeine
                 .newBuilder()
-                // Only refresh keys at TTL - they never expire
                 .refreshAfterWrite(globalTtlSeconds, TimeUnit.SECONDS)
+                .expireAfterWrite(globalTtlSeconds * expiryMultiplier, TimeUnit.SECONDS)
                 .build(new CacheLoader<CacheKey, Key>() {
                     @Override
                     public Key load(CacheKey key) throws Exception {
-                        // Use the resolver provided in the cache key - eliminates registry lookup race condition
-                        if (key.resolver == null) {
-                            throw new IllegalStateException("Resolver not provided for index: " + key.indexUuid);
-                        }
-                        return key.resolver.loadKeyFromMasterKeyProvider();
+                        return loadKeyWithThrottling(key);
                     }
 
                     @Override
                     public Key reload(CacheKey key, Key oldValue) throws Exception {
-                        try {
-                            // Use the resolver provided in the cache key for refresh
-                            if (key.resolver == null) {
-                                // Fallback: try to get from registry if not provided (shouldn't happen)
-                                KeyIvResolver resolver = IndexKeyResolverRegistry.getResolver(key.indexUuid);
-                                if (resolver == null) {
-                                    // Index might have been deleted, keep using old key
-                                    return oldValue;
-                                }
-                                return ((DefaultKeyIvResolver) resolver).loadKeyFromMasterKeyProvider();
+                        // Use the resolver provided in the cache key for refresh
+                        if (key.resolver == null) {
+                            // Fallback: try to get from registry if not provided (shouldn't happen)
+                            KeyIvResolver resolver = IndexKeyResolverRegistry.getResolver(key.indexUuid);
+                            if (resolver == null) {
+                                logger.warn("Resolver not found for index {} during reload, index may have been deleted", key.indexUuid);
+                                // Throw exception to let cache track failure
+                                throw new IllegalStateException("Resolver not found for index: " + key.indexUuid);
                             }
+                            Key newKey = ((DefaultKeyIvResolver) resolver).loadKeyFromMasterKeyProvider();
+                            // Clear failure state on successful reload
+                            failureTracker.remove(key.indexUuid);
+                            logger.debug("Successfully reloaded key for index: {}", key.indexUuid);
+                            return newKey;
+                        }
 
+                        try {
                             Key newKey = key.resolver.loadKeyFromMasterKeyProvider();
+                            // Clear failure state on successful reload
+                            failureTracker.remove(key.indexUuid);
+                            logger.debug("Successfully reloaded key for index: {}", key.indexUuid);
                             return newKey;
                         } catch (Exception e) {
-                            // If reload fails, keep using the old key
-                            return oldValue;
+                            // Track the failure
+                            failureTracker.computeIfAbsent(key.indexUuid, k -> new FailureState(e)).recordFailure(e);
+                            logger.warn("Failed to reload key for index: {}, error: {}", key.indexUuid, e.getMessage());
+                            // Throw exception to let Caffeine track consecutive failures for expiration
+                            throw e;
                         }
                     }
                 });
+        }
+    }
+
+    /**
+     * Loads a key with retry throttling to prevent DOS on Master Key Provider.
+     * If a recent load attempt failed, this method will not retry until the retry interval has passed.
+     * 
+     * @param key the cache key
+     * @return the loaded encryption key
+     * @throws Exception if key loading fails
+     */
+    private Key loadKeyWithThrottling(CacheKey key) throws Exception {
+        if (key.resolver == null) {
+            throw new IllegalStateException("Resolver not provided for index: " + key.indexUuid);
+        }
+
+        // Check if we should throttle retry attempts
+        FailureState state = failureTracker.get(key.indexUuid);
+        if (state != null) {
+            long secondsSinceLastFailure = state.getSecondsSinceLastFailure();
+            if (secondsSinceLastFailure < retryIntervalSeconds) {
+                logger
+                    .debug(
+                        "Throttling load retry for index: {}, {} seconds since last failure (minimum: {} seconds)",
+                        key.indexUuid,
+                        secondsSinceLastFailure,
+                        retryIntervalSeconds
+                    );
+                // Re-throw the last exception without attempting a new load
+                throw state.lastException.get();
+            }
+        }
+
+        try {
+            Key loadedKey = key.resolver.loadKeyFromMasterKeyProvider();
+            // Clear failure state on successful load
+            failureTracker.remove(key.indexUuid);
+            logger.info("Successfully loaded key for index: {}", key.indexUuid);
+            return loadedKey;
+        } catch (Exception e) {
+            // Track the failure with current timestamp
+            failureTracker.computeIfAbsent(key.indexUuid, k -> new FailureState(e)).recordFailure(e);
+            logger.error("Failed to load key for index: {}, error: {}", key.indexUuid, e.getMessage());
+            throw e;
         }
     }
 
@@ -245,6 +327,8 @@ public class NodeLevelKeyCache {
     public void evict(String indexUuid) {
         Objects.requireNonNull(indexUuid, "indexUuid cannot be null");
         keyCache.invalidate(new CacheKey(indexUuid));
+        failureTracker.remove(indexUuid);
+        logger.debug("Evicted key and cleared failure state for index: {}", indexUuid);
     }
 
     /**
@@ -258,11 +342,12 @@ public class NodeLevelKeyCache {
     }
 
     /**
-     * Clears all cached keys.
+     * Clears all cached keys and failure states.
      * This method is primarily for testing purposes.
      */
     public void clear() {
         keyCache.invalidateAll();
+        failureTracker.clear();
     }
 
     /**
