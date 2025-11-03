@@ -230,7 +230,7 @@ public class NodeLevelKeyCache {
                             Key newKey = ((DefaultKeyIvResolver) resolver).loadKeyFromMasterKeyProvider();
                             // Clear failure state on successful reload
                             failureTracker.remove(key.indexUuid);
-                            logger.debug("Successfully reloaded key for index: {}", key.indexUuid);
+                            logger.info("Successfully reloaded key for index: {}", key.indexUuid);
                             return newKey;
                         }
 
@@ -238,7 +238,7 @@ public class NodeLevelKeyCache {
                             Key newKey = key.resolver.loadKeyFromMasterKeyProvider();
                             // Clear failure state on successful reload
                             failureTracker.remove(key.indexUuid);
-                            logger.debug("Successfully reloaded key for index: {}", key.indexUuid);
+                            logger.info("Successfully reloaded key for index: {}", key.indexUuid);
                             return newKey;
                         } catch (Exception e) {
                             // Track the failure
