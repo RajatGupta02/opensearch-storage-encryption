@@ -243,7 +243,7 @@ public class NodeLevelKeyCache {
                         } catch (Exception e) {
                             // Track the failure
                             failureTracker.computeIfAbsent(key.indexUuid, k -> new FailureState(e)).recordFailure(e);
-                            logger.warn("Failed to reload key for index: {}, error: {}", key.indexUuid, e.getMessage());
+                            // logger.warn("Failed to reload key for index: {}, error: {}", key.indexUuid, e.getMessage());
                             // Throw exception to let Caffeine track consecutive failures for expiration
                             throw e;
                         }
@@ -291,7 +291,7 @@ public class NodeLevelKeyCache {
         } catch (Exception e) {
             // Track the failure with current timestamp
             failureTracker.computeIfAbsent(key.indexUuid, k -> new FailureState(e)).recordFailure(e);
-            logger.error("Failed to load key for index: {}, error: {}", key.indexUuid, e.getMessage());
+            // logger.error("Failed to load key for index: {}, error: {}", key.indexUuid, e.getMessage());
             throw e;
         }
     }
