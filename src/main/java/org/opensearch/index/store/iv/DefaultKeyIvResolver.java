@@ -159,7 +159,8 @@ public class DefaultKeyIvResolver implements KeyIvResolver {
         try {
             return NodeLevelKeyCache.getInstance().get(indexUuid, this);
         } catch (Exception e) {
-            throw new RuntimeException("Failed to get encryption key", e);
+            // Suppress stack trace to avoid log spam when keys are disabled or unavailable
+            throw new KeyCacheException("Failed to get encryption key for index: " + indexUuid, e, true);
         }
     }
 
