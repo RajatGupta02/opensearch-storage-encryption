@@ -185,21 +185,6 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
             Property.NodeScope
         );
 
-    /**
-     * Minimum interval between retry attempts on failed key loads (in seconds).
-     * Prevents DOS on Master Key Provider by throttling retry attempts.
-     * Default is 300 seconds (5 minutes).
-     * Minimum value is 1 second.
-     * This setting applies globally to all indices.
-     */
-    public static final Setting<Integer> NODE_KEY_RETRY_INTERVAL_SECS_SETTING = Setting
-        .intSetting(
-            "node.store.crypto.key_retry_interval_seconds",
-            300,    // default: 5 minutes
-            1,      // minimum: at least 1 second
-            Property.NodeScope
-        );
-
     MasterKeyProvider getKeyProvider(IndexSettings indexSettings) {
         final String KEY_PROVIDER = indexSettings.getValue(INDEX_KEY_PROVIDER_SETTING);
 

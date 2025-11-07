@@ -14,8 +14,13 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest;
+import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.index.store.CryptoDirectoryFactory;
+import org.opensearch.transport.client.Client;
 
 import com.github.benmanes.caffeine.cache.CacheLoader;
 import com.github.benmanes.caffeine.cache.Caffeine;
@@ -48,17 +53,19 @@ public class NodeLevelKeyCache {
     private final LoadingCache<CacheKey, Key> keyCache;
     private final long globalTtlSeconds;
     private final int expiryMultiplier;
-    private final long retryIntervalSeconds;
+    private final Client client;
+    private final ClusterService clusterService;
 
-    // Track failures per index to implement DOS protection and retry throttling
+    // Track failures per index to implement write block protection
     private final ConcurrentHashMap<String, FailureState> failureTracker;
 
     /**
-     * Tracks failure state for an index to implement retry throttling.
+     * Tracks failure state for an index and write block status.
      */
     static class FailureState {
         final AtomicLong lastFailureTimeMillis;
         final AtomicReference<Exception> lastException;
+        volatile boolean blockApplied = false;
 
         FailureState(Exception exception) {
             this.lastFailureTimeMillis = new AtomicLong(System.currentTimeMillis());
@@ -68,10 +75,6 @@ public class NodeLevelKeyCache {
         void recordFailure(Exception exception) {
             lastFailureTimeMillis.set(System.currentTimeMillis());
             lastException.set(exception);
-        }
-
-        long getSecondsSinceLastFailure() {
-            return (System.currentTimeMillis() - lastFailureTimeMillis.get()) / 1000;
         }
     }
 
@@ -117,28 +120,28 @@ public class NodeLevelKeyCache {
     }
 
     /**
-     * Initializes the singleton instance with node-level settings.
+     * Initializes the singleton instance with node-level settings, client, and cluster service.
      * This should be called once during plugin initialization.
      * 
      * @param nodeSettings the node settings containing global TTL configuration
+     * @param client the client for cluster state updates (write block operations)
+     * @param clusterService the cluster service for looking up index metadata
      */
-    public static synchronized void initialize(Settings nodeSettings) {
+    public static synchronized void initialize(Settings nodeSettings, Client client, ClusterService clusterService) {
         if (INSTANCE == null) {
             int globalTtlSeconds = CryptoDirectoryFactory.NODE_KEY_REFRESH_INTERVAL_SECS_SETTING.get(nodeSettings);
             int expiryMultiplier = CryptoDirectoryFactory.NODE_KEY_EXPIRY_MULTIPLIER_SETTING.get(nodeSettings);
-            int retryIntervalSeconds = CryptoDirectoryFactory.NODE_KEY_RETRY_INTERVAL_SECS_SETTING.get(nodeSettings);
 
-            INSTANCE = new NodeLevelKeyCache((long) globalTtlSeconds, expiryMultiplier, (long) retryIntervalSeconds);
+            INSTANCE = new NodeLevelKeyCache((long) globalTtlSeconds, expiryMultiplier, client, clusterService);
 
             if (globalTtlSeconds == -1) {
                 logger.info("Initialized NodeLevelKeyCache with refresh disabled (TTL: -1)");
             } else {
                 logger
                     .info(
-                        "Initialized NodeLevelKeyCache with refresh TTL: {} seconds, expiry multiplier: {}, retry interval: {} seconds",
+                        "Initialized NodeLevelKeyCache with refresh TTL: {} seconds, expiry multiplier: {}",
                         globalTtlSeconds,
-                        expiryMultiplier,
-                        retryIntervalSeconds
+                        expiryMultiplier
                     );
             }
         }
@@ -175,19 +178,19 @@ public class NodeLevelKeyCache {
      *  <li>After consecutive failures for the expiry duration (refreshTTL * expiryMultiplier),
      *      the entry is evicted from the cache.</li>
      * 
-     *  <li>Load attempts are throttled with a minimum retry interval to prevent DOS on Master Key Provider.</li>
+     *  <li>On first load failure after cache expiry, a write block is applied to prevent log spam.</li>
      * 
-     *  <li>When Master Key Provider is restored, the next get() will trigger a fresh load and recover automatically.</li>
+     *  <li>When Master Key Provider is restored, write block is automatically removed.</li>
      * </ul>
      * 
      * @param globalTtlSeconds the refresh TTL in seconds (-1 means never refresh)
      * @param expiryMultiplier multiplier for expiration (expiryTime = refreshTTL * multiplier)
-     * @param retryIntervalSeconds minimum seconds between load retry attempts
      */
-    private NodeLevelKeyCache(long globalTtlSeconds, int expiryMultiplier, long retryIntervalSeconds) {
+    private NodeLevelKeyCache(long globalTtlSeconds, int expiryMultiplier, Client client, ClusterService clusterService) {
         this.globalTtlSeconds = globalTtlSeconds;
         this.expiryMultiplier = expiryMultiplier;
-        this.retryIntervalSeconds = retryIntervalSeconds;
+        this.client = client;
+        this.clusterService = clusterService;
         this.failureTracker = new ConcurrentHashMap<>();
 
         // Check if refresh is disabled
@@ -199,7 +202,7 @@ public class NodeLevelKeyCache {
                 .build(new CacheLoader<CacheKey, Key>() {
                     @Override
                     public Key load(CacheKey key) throws Exception {
-                        return loadKeyWithThrottling(key);
+                        return loadKey(key);
                     }
                     // No reload method needed since refresh is disabled
                 });
@@ -213,7 +216,7 @@ public class NodeLevelKeyCache {
                 .build(new CacheLoader<CacheKey, Key>() {
                     @Override
                     public Key load(CacheKey key) throws Exception {
-                        return loadKeyWithThrottling(key);
+                        return loadKey(key);
                     }
 
                     @Override
@@ -253,53 +256,128 @@ public class NodeLevelKeyCache {
     }
 
     /**
-     * Loads a key with retry throttling to prevent DOS on Master Key Provider.
-     * If a recent load attempt failed, this method will not retry until the retry interval has passed.
+     * Loads a key from Master Key Provider and handles failures by applying write blocks.
+     * 
+     * <p>Success: If a write block was previously applied, it is automatically removed.
+     * <p>Failure: A write block is immediately applied to prevent log spam from subsequent operations.
      * 
      * @param key the cache key
      * @return the loaded encryption key
      * @throws Exception if key loading fails
      */
-    private Key loadKeyWithThrottling(CacheKey key) throws Exception {
+    private Key loadKey(CacheKey key) throws Exception {
         if (key.resolver == null) {
             throw new IllegalStateException("Resolver not provided for index: " + key.indexUuid);
         }
 
-        // Check if we should throttle retry attempts
-        FailureState state = failureTracker.get(key.indexUuid);
-        if (state != null) {
-            long secondsSinceLastFailure = state.getSecondsSinceLastFailure();
-            if (secondsSinceLastFailure < retryIntervalSeconds) {
-                logger
-                    .debug(
-                        "Throttling load retry for index: {}, {} seconds since last failure (minimum: {} seconds)",
-                        key.indexUuid,
-                        secondsSinceLastFailure,
-                        retryIntervalSeconds
-                    );
-                // Re-throw the last exception without attempting a new load
-                Exception lastException = state.lastException.get();
-                // Wrap if not already a KeyCacheException to avoid double-wrapping
-                if (lastException instanceof KeyCacheException) {
-                    throw lastException;
-                } else {
-                    throw new KeyCacheException("Throttled load retry for index: " + key.indexUuid, lastException, true);
-                }
-            }
-        }
-
         try {
             Key loadedKey = key.resolver.loadKeyFromMasterKeyProvider();
+
+            // Success! Remove write block if it was applied
+            FailureState state = failureTracker.get(key.indexUuid);
+            if (state != null && state.blockApplied) {
+                removeWriteBlock(key.indexUuid);
+                logger.info("Removed write block from index: {}, key successfully loaded", key.indexUuid);
+            }
+
             // Clear failure state on successful load
             failureTracker.remove(key.indexUuid);
             logger.info("Successfully loaded key for index: {}", key.indexUuid);
             return loadedKey;
+
         } catch (Exception e) {
-            // Track the failure with current timestamp
-            failureTracker.computeIfAbsent(key.indexUuid, k -> new FailureState(e)).recordFailure(e);
-            // logger.error("Failed to load key for index: {}, error: {}", key.indexUuid, e.getMessage());
+            // Track the failure
+            FailureState state = failureTracker.computeIfAbsent(key.indexUuid, k -> new FailureState(e));
+            state.recordFailure(e);
+
+            // Apply write block immediately on first failure
+            if (!state.blockApplied) {
+                applyWriteBlock(key.indexUuid);
+                state.blockApplied = true;
+                logger.error("Applied write block to index: {} due to key load failure", key.indexUuid);
+            }
+
             // Wrap exception to suppress stack trace and avoid log spam
             throw new KeyCacheException("Failed to load key for index: " + key.indexUuid, e, true);
+        }
+    }
+
+    /**
+     * Gets the index name for a given UUID from the cluster state.
+     * 
+     * @param indexUuid the index UUID
+     * @return the index name, or null if not found
+     */
+    private String getIndexNameFromUuid(String indexUuid) {
+        try {
+            Metadata metadata = clusterService.state().metadata();
+            for (IndexMetadata indexMetadata : metadata.indices().values()) {
+                if (indexMetadata.getIndexUUID().equals(indexUuid)) {
+                    return indexMetadata.getIndex().getName();
+                }
+            }
+            return null;
+        } catch (Exception e) {
+            logger.error("Failed to lookup index name for UUID: {}", indexUuid, e);
+            return null;
+        }
+    }
+
+    /**
+     * Applies a write block to the specified index to prevent operations from failing.
+     * This updates the cluster state to add index.blocks.write setting.
+     * 
+     * @param indexUuid the index UUID
+     */
+    private void applyWriteBlock(String indexUuid) {
+        try {
+            // Get index name from UUID via cluster state
+            String indexName = getIndexNameFromUuid(indexUuid);
+            if (indexName == null) {
+                logger.warn("Cannot apply write block: index name not found for UUID: {}", indexUuid);
+                return;
+            }
+
+            // Build update settings request
+            Settings settings = Settings.builder().put(IndexMetadata.SETTING_BLOCKS_WRITE, true).build();
+
+            UpdateSettingsRequest request = new UpdateSettingsRequest(settings, indexName);
+
+            // Execute async (don't block)
+            client.admin().indices().updateSettings(request).actionGet();
+
+            logger.info("Successfully applied write block to index: {}", indexName);
+        } catch (Exception e) {
+            logger.error("Failed to apply write block to index UUID: {}, error: {}", indexUuid, e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Removes the write block from the specified index when the key becomes available again.
+     * This updates the cluster state to remove index.blocks.write setting.
+     * 
+     * @param indexUuid the index UUID
+     */
+    private void removeWriteBlock(String indexUuid) {
+        try {
+            // Get index name from UUID via cluster state
+            String indexName = getIndexNameFromUuid(indexUuid);
+            if (indexName == null) {
+                logger.warn("Cannot remove write block: index name not found for UUID: {}", indexUuid);
+                return;
+            }
+
+            // Build update settings request to remove write block
+            Settings settings = Settings.builder().putNull(IndexMetadata.SETTING_BLOCKS_WRITE).build();
+
+            UpdateSettingsRequest request = new UpdateSettingsRequest(settings, indexName);
+
+            // Execute async (don't block)
+            client.admin().indices().updateSettings(request).actionGet();
+
+            logger.info("Successfully removed write block from index: {}", indexName);
+        } catch (Exception e) {
+            logger.error("Failed to remove write block from index UUID: {}, error: {}", indexUuid, e.getMessage(), e);
         }
     }
 
