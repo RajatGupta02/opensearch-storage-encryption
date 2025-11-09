@@ -230,23 +230,64 @@ public class NodeLevelKeyCache {
                                 // Throw exception to let cache track failure
                                 throw new IllegalStateException("Resolver not found for index: " + key.indexUuid);
                             }
-                            Key newKey = ((DefaultKeyIvResolver) resolver).loadKeyFromMasterKeyProvider();
-                            // Clear failure state on successful reload
-                            failureTracker.remove(key.indexUuid);
-                            logger.info("Successfully reloaded key for index: {}", key.indexUuid);
-                            return newKey;
+
+                            try {
+                                Key newKey = ((DefaultKeyIvResolver) resolver).loadKeyFromMasterKeyProvider();
+
+                                // Success! Remove write block if it was applied
+                                FailureState state = failureTracker.get(key.indexUuid);
+                                if (state != null && state.blockApplied) {
+                                    removeWriteBlock(key.indexUuid);
+                                    logger.info("Removed write block from index: {}, key successfully reloaded", key.indexUuid);
+                                }
+
+                                // Clear failure state on successful reload
+                                failureTracker.remove(key.indexUuid);
+                                logger.info("Successfully reloaded key for index: {}", key.indexUuid);
+                                return newKey;
+                            } catch (Exception e) {
+                                // Track the failure
+                                FailureState state = failureTracker.computeIfAbsent(key.indexUuid, k -> new FailureState(e));
+                                state.recordFailure(e);
+
+                                // Apply write block immediately on first failure during reload
+                                if (!state.blockApplied) {
+                                    applyWriteBlock(key.indexUuid);
+                                    state.blockApplied = true;
+                                    logger.error("Applied write block to index: {} due to key reload failure", key.indexUuid);
+                                }
+
+                                // Wrap exception to suppress stack trace and avoid log spam
+                                throw new KeyCacheException("Failed to reload key for index: " + key.indexUuid, e, true);
+                            }
                         }
 
                         try {
                             Key newKey = key.resolver.loadKeyFromMasterKeyProvider();
+
+                            // Success! Remove write block if it was applied
+                            FailureState state = failureTracker.get(key.indexUuid);
+                            if (state != null && state.blockApplied) {
+                                removeWriteBlock(key.indexUuid);
+                                logger.info("Removed write block from index: {}, key successfully reloaded", key.indexUuid);
+                            }
+
                             // Clear failure state on successful reload
                             failureTracker.remove(key.indexUuid);
                             logger.info("Successfully reloaded key for index: {}", key.indexUuid);
                             return newKey;
                         } catch (Exception e) {
                             // Track the failure
-                            failureTracker.computeIfAbsent(key.indexUuid, k -> new FailureState(e)).recordFailure(e);
-                            // logger.warn("Failed to reload key for index: {}, error: {}", key.indexUuid, e.getMessage());
+                            FailureState state = failureTracker.computeIfAbsent(key.indexUuid, k -> new FailureState(e));
+                            state.recordFailure(e);
+
+                            // Apply write block immediately on first failure during reload
+                            if (!state.blockApplied) {
+                                applyWriteBlock(key.indexUuid);
+                                state.blockApplied = true;
+                                logger.error("Applied write block to index: {} due to key reload failure", key.indexUuid);
+                            }
+
                             // Wrap exception to suppress stack trace and avoid log spam
                             throw new KeyCacheException("Failed to reload key for index: " + key.indexUuid, e, true);
                         }
