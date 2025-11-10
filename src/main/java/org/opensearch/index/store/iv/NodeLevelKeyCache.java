@@ -194,6 +194,10 @@ public class NodeLevelKeyCache {
         this.clusterService = clusterService;
         this.failureTracker = new ConcurrentHashMap<>();
 
+        // Suppress Caffeine's internal logging to reduce log spam during key reload failures
+        // This prevents duplicate exception logging from Caffeine's BoundedLocalCache
+        java.util.logging.Logger.getLogger("com.github.benmanes.caffeine.cache").setLevel(java.util.logging.Level.SEVERE);
+
         // Check if refresh is disabled
         if (globalTtlSeconds == -1L) {
             // Create cache without refresh
@@ -246,8 +250,12 @@ public class NodeLevelKeyCache {
                             return newKey;
                         } catch (Exception e) {
                             failureTracker.computeIfAbsent(key.indexUuid, k -> new FailureState(e)).recordFailure(e);
-                            // Wrap exception to suppress stack trace and avoid log spam
-                            throw new KeyCacheException("Failed to reload key for index: " + key.indexUuid, e, true);
+
+                            throw new KeyCacheException(
+                                "Failed to reload key for index: " + key.indexUuid + ". Error: " + e.getMessage(),
+                                null,  // No cause - eliminates ~40 lines of AWS SDK stack trace
+                                true
+                            );
                         }
                     }
                 });
