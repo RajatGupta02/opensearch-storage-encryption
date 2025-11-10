@@ -14,7 +14,8 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest;
+import org.opensearch.action.admin.indices.close.CloseIndexRequest;
+import org.opensearch.action.admin.indices.open.OpenIndexRequest;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.service.ClusterService;
@@ -60,12 +61,12 @@ public class NodeLevelKeyCache {
     private final ConcurrentHashMap<String, FailureState> failureTracker;
 
     /**
-     * Tracks failure state for an index and write block status.
+     * Tracks failure state for an index and closed status.
      */
     static class FailureState {
         final AtomicLong lastFailureTimeMillis;
         final AtomicReference<Exception> lastException;
-        volatile boolean blockApplied = false;
+        volatile boolean indexClosed = false;
 
         FailureState(Exception exception) {
             this.lastFailureTimeMillis = new AtomicLong(System.currentTimeMillis());
@@ -178,9 +179,9 @@ public class NodeLevelKeyCache {
      *  <li>After consecutive failures for the expiry duration (refreshTTL * expiryMultiplier),
      *      the entry is evicted from the cache.</li>
      * 
-     *  <li>On first load failure after cache expiry, a write block is applied to prevent log spam.</li>
+     *  <li>On first load failure after cache expiry, a close on index is applied to prevent log spam.</li>
      * 
-     *  <li>When Master Key Provider is restored, write block is automatically removed.</li>
+     *  <li>When Master Key Provider is restored, the closed index is automatically opened again.</li>
      * </ul>
      * 
      * @param globalTtlSeconds the refresh TTL in seconds (-1 means never refresh)
@@ -254,10 +255,7 @@ public class NodeLevelKeyCache {
     }
 
     /**
-     * Loads a key from Master Key Provider and handles failures by applying write blocks.
-     * 
-     * <p>Success: If a write block was previously applied, it is automatically removed.
-     * <p>Failure: A write block is immediately applied to prevent log spam from subsequent operations.
+     * Loads a key from Master Key Provider and handles failures by applying closed index.
      * 
      * @param key the cache key
      * @return the loaded encryption key
@@ -271,11 +269,11 @@ public class NodeLevelKeyCache {
         try {
             Key loadedKey = key.resolver.loadKeyFromMasterKeyProvider();
 
-            // Success! Remove write block if it was applied
+            // Success! Open index if it was closed
             FailureState state = failureTracker.get(key.indexUuid);
-            if (state != null && state.blockApplied) {
-                removeWriteBlock(key.indexUuid);
-                logger.info("Removed write block from index: {}, key successfully loaded", key.indexUuid);
+            if (state != null && state.indexClosed) {
+                openIndex(key.indexUuid);
+                logger.info("Opened index: {}, key successfully loaded", key.indexUuid);
             }
 
             // Clear failure state on successful load
@@ -288,11 +286,11 @@ public class NodeLevelKeyCache {
             FailureState state = failureTracker.computeIfAbsent(key.indexUuid, k -> new FailureState(e));
             state.recordFailure(e);
 
-            // Apply write block immediately on first failure
-            if (!state.blockApplied) {
-                applyWriteBlock(key.indexUuid);
-                state.blockApplied = true;
-                logger.error("Applied write block to index: {} due to key load failure", key.indexUuid);
+            // Close index immediately on first failure
+            if (!state.indexClosed) {
+                closeIndex(key.indexUuid);
+                state.indexClosed = true;
+                logger.error("Closed index: {} due to key load failure", key.indexUuid);
             }
 
             // Wrap exception to suppress stack trace and avoid log spam
@@ -322,60 +320,57 @@ public class NodeLevelKeyCache {
     }
 
     /**
-     * Applies a write block to the specified index to prevent operations from failing.
-     * This updates the cluster state to add index.blocks.write setting.
+     * Closes the specified index to prevent all operations when encryption key is unavailable.
+     * This provides security by blocking access to data that cannot be properly decrypted,
+     * and persists through blue-green deployments.
      * 
      * @param indexUuid the index UUID
      */
-    private void applyWriteBlock(String indexUuid) {
+    private void closeIndex(String indexUuid) {
         try {
             // Get index name from UUID via cluster state
             String indexName = getIndexNameFromUuid(indexUuid);
             if (indexName == null) {
-                logger.warn("Cannot apply write block: index name not found for UUID: {}", indexUuid);
+                logger.warn("Cannot close index: index name not found for UUID: {}", indexUuid);
                 return;
             }
 
-            // Build update settings request
-            Settings settings = Settings.builder().put(IndexMetadata.SETTING_BLOCKS_WRITE, true).build();
-
-            UpdateSettingsRequest request = new UpdateSettingsRequest(settings, indexName);
+            // Create close index request
+            CloseIndexRequest request = new CloseIndexRequest(indexName);
 
             // Execute async (don't block)
-            client.admin().indices().updateSettings(request).actionGet();
+            client.admin().indices().close(request).actionGet();
 
-            logger.info("Successfully applied write block to index: {}", indexName);
+            logger.info("Successfully closed index: {}", indexName);
         } catch (Exception e) {
-            logger.error("Failed to apply write block to index UUID: {}, error: {}", indexUuid, e.getMessage(), e);
+            logger.error("Failed to close index UUID: {}, error: {}", indexUuid, e.getMessage(), e);
         }
     }
 
     /**
-     * Removes the write block from the specified index when the key becomes available again.
-     * This updates the cluster state to remove index.blocks.write setting.
+     * Opens the specified index when the encryption key becomes available again.
+     * This automatically restores access after key recovery.
      * 
      * @param indexUuid the index UUID
      */
-    private void removeWriteBlock(String indexUuid) {
+    private void openIndex(String indexUuid) {
         try {
             // Get index name from UUID via cluster state
             String indexName = getIndexNameFromUuid(indexUuid);
             if (indexName == null) {
-                logger.warn("Cannot remove write block: index name not found for UUID: {}", indexUuid);
+                logger.warn("Cannot open index: index name not found for UUID: {}", indexUuid);
                 return;
             }
 
-            // Build update settings request to remove write block
-            Settings settings = Settings.builder().putNull(IndexMetadata.SETTING_BLOCKS_WRITE).build();
-
-            UpdateSettingsRequest request = new UpdateSettingsRequest(settings, indexName);
+            // Create open index request
+            OpenIndexRequest request = new OpenIndexRequest(indexName);
 
             // Execute async (don't block)
-            client.admin().indices().updateSettings(request).actionGet();
+            client.admin().indices().open(request).actionGet();
 
-            logger.info("Successfully removed write block from index: {}", indexName);
+            logger.info("Successfully opened index: {}", indexName);
         } catch (Exception e) {
-            logger.error("Failed to remove write block from index UUID: {}, error: {}", indexUuid, e.getMessage(), e);
+            logger.error("Failed to open index UUID: {}, error: {}", indexUuid, e.getMessage(), e);
         }
     }
 
