@@ -9,6 +9,7 @@ import java.util.Objects;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -66,16 +67,23 @@ public class NodeLevelKeyCache {
     static class FailureState {
         final AtomicLong lastFailureTimeMillis;
         final AtomicReference<Exception> lastException;
+        final AtomicInteger consecutiveFailures;
         volatile boolean indexClosed = false;
 
         FailureState(Exception exception) {
             this.lastFailureTimeMillis = new AtomicLong(System.currentTimeMillis());
             this.lastException = new AtomicReference<>(exception);
+            this.consecutiveFailures = new AtomicInteger(1);
         }
 
         void recordFailure(Exception exception) {
             lastFailureTimeMillis.set(System.currentTimeMillis());
             lastException.set(exception);
+            consecutiveFailures.incrementAndGet();
+        }
+
+        int getConsecutiveFailures() {
+            return consecutiveFailures.get();
         }
     }
 
@@ -249,7 +257,23 @@ public class NodeLevelKeyCache {
                             logger.info("Successfully reloaded key for index: {}", key.indexUuid);
                             return newKey;
                         } catch (Exception e) {
-                            failureTracker.computeIfAbsent(key.indexUuid, k -> new FailureState(e)).recordFailure(e);
+                            FailureState state = failureTracker.computeIfAbsent(key.indexUuid, k -> new FailureState(e));
+                            state.recordFailure(e);
+
+                            int failureCount = state.getConsecutiveFailures();
+
+                            // Close index after 2nd consecutive failure (before cache expires at 3rd)
+                            // This allows operations to complete with the cached key before index is closed
+                            if (failureCount == expiryMultiplier - 1 && !state.indexClosed) {
+                                closeIndex(key.indexUuid);
+                                state.indexClosed = true;
+                                logger
+                                    .warn(
+                                        "Closed index after {} consecutive reload failures (before cache expiry): {}",
+                                        failureCount,
+                                        key.indexUuid
+                                    );
+                            }
 
                             throw new KeyCacheException(
                                 "Failed to reload key for index: " + key.indexUuid + ". Error: " + e.getMessage(),
