@@ -257,12 +257,20 @@ public class NodeLevelKeyCache {
                             logger.info("Successfully reloaded key for index: {}", key.indexUuid);
                             return newKey;
                         } catch (Exception e) {
-                            FailureState state = failureTracker.computeIfAbsent(key.indexUuid, k -> new FailureState(e));
-                            state.recordFailure(e);
+                            // Get or create failure state, but don't double-count on first failure
+                            FailureState state = failureTracker.get(key.indexUuid);
+                            if (state == null) {
+                                // First failure - create with count = 1
+                                state = new FailureState(e);
+                                failureTracker.put(key.indexUuid, state);
+                            } else {
+                                // Subsequent failure - increment count
+                                state.recordFailure(e);
+                            }
 
                             int failureCount = state.getConsecutiveFailures();
 
-                            // Close index after 2nd consecutive failure (before cache expires at 3rd)
+                            // Close index after (expiryMultiplier - 1) consecutive failures
                             // This allows operations to complete with the cached key before index is closed
                             if (failureCount == expiryMultiplier - 1 && !state.indexClosed) {
                                 closeIndex(key.indexUuid);
@@ -314,19 +322,29 @@ public class NodeLevelKeyCache {
             return loadedKey;
 
         } catch (Exception e) {
-            // Track the failure
-            FailureState state = failureTracker.computeIfAbsent(key.indexUuid, k -> new FailureState(e));
-            state.recordFailure(e);
+            // Get existing failure state (may exist from failed reload)
+            FailureState state = failureTracker.get(key.indexUuid);
 
-            // Close index immediately on first failure
-            if (!state.indexClosed) {
-                closeIndex(key.indexUuid);
-                state.indexClosed = true;
-                logger.error("Closed index: {} due to key load failure", key.indexUuid);
+            // If index is already closed (from reload failures), fail fast without retry
+            if (state != null && state.indexClosed) {
+                logger.debug("Index already closed, failing fast for UUID: {}", key.indexUuid);
+                throw new KeyCacheException("Index closed due to key unavailability: " + key.indexUuid, null, true);
             }
 
+            // First load failure after cache expiry - close index immediately
+            if (state == null) {
+                state = new FailureState(e);
+                failureTracker.put(key.indexUuid, state);
+            } else {
+                state.recordFailure(e);
+            }
+
+            closeIndex(key.indexUuid);
+            state.indexClosed = true;
+            logger.error("Closed index: {} due to key load failure", key.indexUuid);
+
             // Wrap exception to suppress stack trace and avoid log spam
-            throw new KeyCacheException("Failed to load key for index: " + key.indexUuid, e, true);
+            throw new KeyCacheException("Failed to load key for index: " + key.indexUuid + ". Error: " + e.getMessage(), null, true);
         }
     }
 
