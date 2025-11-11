@@ -308,9 +308,10 @@ public class NodeLevelKeyCache {
         try {
             Key loadedKey = key.resolver.loadKeyFromMasterKeyProvider();
 
-            // Success! Always attempt to remove blocks (handles recovery case where state was cleared)
-            // removeBlocks() gracefully handles the case where blocks don't exist
-            removeBlocks(key.indexUuid);
+            // Success! Check if blocks exist before attempting removal
+            if (hasBlocks(key.indexUuid)) {
+                removeBlocks(key.indexUuid);
+            }
 
             // Clear failure state on successful load
             failureTracker.remove(key.indexUuid);
@@ -363,6 +364,33 @@ public class NodeLevelKeyCache {
         } catch (Exception e) {
             logger.error("Failed to lookup index name for UUID: {}", indexUuid, e);
             return null;
+        }
+    }
+
+    /**
+     * Checks if read or write blocks are currently applied to the index.
+     * 
+     * @param indexUuid the index UUID
+     * @return true if either read or write blocks are applied, false otherwise
+     */
+    private boolean hasBlocks(String indexUuid) {
+        try {
+            Metadata metadata = clusterService.state().metadata();
+            for (IndexMetadata indexMetadata : metadata.indices().values()) {
+                if (indexMetadata.getIndexUUID().equals(indexUuid)) {
+                    Settings indexSettings = indexMetadata.getSettings();
+
+                    // Check for read or write blocks
+                    boolean readBlock = indexSettings.getAsBoolean("index.blocks.read", false);
+                    boolean writeBlock = indexSettings.getAsBoolean("index.blocks.write", false);
+
+                    return readBlock || writeBlock;
+                }
+            }
+            return false; // Index not found
+        } catch (Exception e) {
+            logger.warn("Failed to check blocks for index UUID: {}", indexUuid, e);
+            return false; // Assume no blocks on error
         }
     }
 
