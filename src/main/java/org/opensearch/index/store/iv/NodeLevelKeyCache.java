@@ -15,8 +15,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.opensearch.action.admin.indices.close.CloseIndexRequest;
-import org.opensearch.action.admin.indices.open.OpenIndexRequest;
+import org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.service.ClusterService;
@@ -270,14 +269,14 @@ public class NodeLevelKeyCache {
 
                             int failureCount = state.getConsecutiveFailures();
 
-                            // Close index after (expiryMultiplier - 1) consecutive failures
-                            // This allows operations to complete with the cached key before index is closed
+                            // Apply blocks after (expiryMultiplier - 1) consecutive failures
+                            // This allows operations to complete with the cached key before blocks are applied
                             if (failureCount == expiryMultiplier - 1 && !state.indexClosed) {
-                                closeIndex(key.indexUuid);
+                                applyBlocks(key.indexUuid);
                                 state.indexClosed = true;
                                 logger
                                     .warn(
-                                        "Closed index after {} consecutive reload failures (before cache expiry): {}",
+                                        "Applied read+write blocks after {} consecutive reload failures (before cache expiry): {}",
                                         failureCount,
                                         key.indexUuid
                                     );
@@ -309,11 +308,11 @@ public class NodeLevelKeyCache {
         try {
             Key loadedKey = key.resolver.loadKeyFromMasterKeyProvider();
 
-            // Success! Open index if it was closed
+            // Success! Remove blocks if they were applied
             FailureState state = failureTracker.get(key.indexUuid);
             if (state != null && state.indexClosed) {
-                openIndex(key.indexUuid);
-                logger.info("Opened index: {}, key successfully loaded", key.indexUuid);
+                removeBlocks(key.indexUuid);
+                logger.info("Removed blocks from index: {}, key successfully loaded", key.indexUuid);
             }
 
             // Clear failure state on successful load
@@ -325,13 +324,13 @@ public class NodeLevelKeyCache {
             // Get existing failure state (may exist from failed reload)
             FailureState state = failureTracker.get(key.indexUuid);
 
-            // If index is already closed (from reload failures), fail fast without retry
+            // If blocks already applied (from reload failures), fail fast without retry
             if (state != null && state.indexClosed) {
-                logger.debug("Index already closed, failing fast for UUID: {}", key.indexUuid);
-                throw new KeyCacheException("Index closed due to key unavailability: " + key.indexUuid, null, true);
+                logger.info("Blocks already applied, failing fast for UUID: {}", key.indexUuid);
+                throw new KeyCacheException("Index blocked due to key unavailability: " + key.indexUuid, null, true);
             }
 
-            // First load failure after cache expiry - close index immediately
+            // First load failure after cache expiry - apply blocks immediately
             if (state == null) {
                 state = new FailureState(e);
                 failureTracker.put(key.indexUuid, state);
@@ -339,9 +338,9 @@ public class NodeLevelKeyCache {
                 state.recordFailure(e);
             }
 
-            closeIndex(key.indexUuid);
+            applyBlocks(key.indexUuid);
             state.indexClosed = true;
-            logger.error("Closed index: {} due to key load failure", key.indexUuid);
+            logger.error("Applied blocks to index: {} due to key load failure", key.indexUuid);
 
             // Wrap exception to suppress stack trace and avoid log spam
             throw new KeyCacheException("Failed to load key for index: " + key.indexUuid + ". Error: " + e.getMessage(), null, true);
@@ -370,57 +369,60 @@ public class NodeLevelKeyCache {
     }
 
     /**
-     * Closes the specified index to prevent all operations when encryption key is unavailable.
-     * This provides security by blocking access to data that cannot be properly decrypted,
-     * and persists through blue-green deployments.
+     * Applies read and write blocks to the specified index to prevent all operations 
+     * when encryption key is unavailable. This provides security by blocking access 
+     * to data that cannot be properly decrypted.
+     * 
+     * Note: Blocks do not persist through blue-green deployments and require manual 
+     * removal after KMS recovery.
      * 
      * @param indexUuid the index UUID
      */
-    private void closeIndex(String indexUuid) {
+    private void applyBlocks(String indexUuid) {
         try {
             // Get index name from UUID via cluster state
             String indexName = getIndexNameFromUuid(indexUuid);
             if (indexName == null) {
-                logger.warn("Cannot close index: index name not found for UUID: {}", indexUuid);
+                logger.warn("Cannot apply blocks: index name not found for UUID: {}", indexUuid);
                 return;
             }
 
-            // Create close index request
-            CloseIndexRequest request = new CloseIndexRequest(indexName);
+            // Apply both read and write blocks
+            Settings settings = Settings.builder().put("index.blocks.read", true).put("index.blocks.write", true).build();
 
-            // Execute async (don't block)
-            client.admin().indices().close(request).actionGet();
+            UpdateSettingsRequest request = new UpdateSettingsRequest(settings, indexName);
+            client.admin().indices().updateSettings(request).actionGet();
 
-            logger.info("Successfully closed index: {}", indexName);
+            logger.info("Successfully applied read+write blocks to index: {}", indexName);
         } catch (Exception e) {
-            logger.error("Failed to close index UUID: {}, error: {}", indexUuid, e.getMessage(), e);
+            logger.error("Failed to apply blocks to index UUID: {}, error: {}", indexUuid, e.getMessage(), e);
         }
     }
 
     /**
-     * Opens the specified index when the encryption key becomes available again.
-     * This automatically restores access after key recovery.
+     * Removes read and write blocks from the specified index when the encryption key 
+     * becomes available again. This restores full access after key recovery.
      * 
      * @param indexUuid the index UUID
      */
-    private void openIndex(String indexUuid) {
+    private void removeBlocks(String indexUuid) {
         try {
             // Get index name from UUID via cluster state
             String indexName = getIndexNameFromUuid(indexUuid);
             if (indexName == null) {
-                logger.warn("Cannot open index: index name not found for UUID: {}", indexUuid);
+                logger.warn("Cannot remove blocks: index name not found for UUID: {}", indexUuid);
                 return;
             }
 
-            // Create open index request
-            OpenIndexRequest request = new OpenIndexRequest(indexName);
+            // Remove both read and write blocks
+            Settings settings = Settings.builder().putNull("index.blocks.read").putNull("index.blocks.write").build();
 
-            // Execute async (don't block)
-            client.admin().indices().open(request).actionGet();
+            UpdateSettingsRequest request = new UpdateSettingsRequest(settings, indexName);
+            client.admin().indices().updateSettings(request).actionGet();
 
-            logger.info("Successfully opened index: {}", indexName);
+            logger.info("Successfully removed read+write blocks from index: {}", indexName);
         } catch (Exception e) {
-            logger.error("Failed to open index UUID: {}, error: {}", indexUuid, e.getMessage(), e);
+            logger.error("Failed to remove blocks from index UUID: {}, error: {}", indexUuid, e.getMessage(), e);
         }
     }
 
