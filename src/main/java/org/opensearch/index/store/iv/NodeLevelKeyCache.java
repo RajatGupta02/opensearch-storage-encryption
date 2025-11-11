@@ -308,15 +308,13 @@ public class NodeLevelKeyCache {
         try {
             Key loadedKey = key.resolver.loadKeyFromMasterKeyProvider();
 
-            // Success! Remove blocks if they were applied
-            FailureState state = failureTracker.get(key.indexUuid);
-            if (state != null && state.indexClosed) {
-                removeBlocks(key.indexUuid);
-                logger.info("Removed blocks from index: {}, key successfully loaded", key.indexUuid);
-            }
+            // Success! Always attempt to remove blocks (handles recovery case where state was cleared)
+            // removeBlocks() gracefully handles the case where blocks don't exist
+            removeBlocks(key.indexUuid);
 
             // Clear failure state on successful load
             failureTracker.remove(key.indexUuid);
+
             logger.info("Successfully loaded key for index: {}", key.indexUuid);
             return loadedKey;
 
