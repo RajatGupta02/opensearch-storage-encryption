@@ -5,9 +5,14 @@
 package org.opensearch.index.store.iv;
 
 import java.security.Key;
+import java.util.HashSet;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -59,6 +64,11 @@ public class NodeLevelKeyCache {
 
     // Track failures per index to implement write block protection
     private final ConcurrentHashMap<String, FailureState> failureTracker;
+
+    // Health monitoring for automatic recovery when KMS is restored
+    private final ScheduledExecutorService healthCheckExecutor;
+    private volatile ScheduledFuture<?> healthCheckTask = null;
+    private static final long HEALTH_CHECK_INTERVAL_SECONDS = 30;
 
     /**
      * Tracks failure state for an index and closed status.
@@ -201,6 +211,9 @@ public class NodeLevelKeyCache {
         this.clusterService = clusterService;
         this.failureTracker = new ConcurrentHashMap<>();
 
+        // Initialize health check executor for monitoring blocked indices
+        this.healthCheckExecutor = Executors.newSingleThreadScheduledExecutor(r -> new Thread(r, "encryption-key-health-check"));
+
         // Suppress Caffeine's internal logging to reduce log spam during key reload failures
         // This prevents duplicate exception logging from Caffeine's BoundedLocalCache
         java.util.logging.Logger.getLogger("com.github.benmanes.caffeine.cache").setLevel(java.util.logging.Level.SEVERE);
@@ -274,6 +287,7 @@ public class NodeLevelKeyCache {
                             if (failureCount == expiryMultiplier - 1 && !state.indexClosed) {
                                 applyBlocks(key.indexUuid);
                                 state.indexClosed = true;
+                                startHealthMonitoring();
                                 logger
                                     .warn(
                                         "Applied read+write blocks after {} consecutive reload failures (before cache expiry): {}",
@@ -339,6 +353,7 @@ public class NodeLevelKeyCache {
 
             applyBlocks(key.indexUuid);
             state.indexClosed = true;
+            startHealthMonitoring();
             logger.error("Applied blocks to index: {} due to key load failure", key.indexUuid);
 
             // Wrap exception to suppress stack trace and avoid log spam
@@ -508,12 +523,115 @@ public class NodeLevelKeyCache {
     }
 
     /**
+     * Starts the health monitoring thread to check blocked indices and automatically 
+     * remove blocks when keys become available again.
+     * This is called when the first index gets blocked.
+     */
+    private synchronized void startHealthMonitoring() {
+        if (healthCheckTask != null && !healthCheckTask.isDone()) {
+            return; // Already running
+        }
+
+        logger.info("Starting KMS health monitoring (checking every {} seconds)", HEALTH_CHECK_INTERVAL_SECONDS);
+        healthCheckTask = healthCheckExecutor
+            .scheduleAtFixedRate(
+                this::checkKmsHealthAndRecover,
+                HEALTH_CHECK_INTERVAL_SECONDS,
+                HEALTH_CHECK_INTERVAL_SECONDS,
+                TimeUnit.SECONDS
+            );
+    }
+
+    /**
+     * Stops the health monitoring thread.
+     * This is called when all blocked indices have been recovered.
+     */
+    private synchronized void stopHealthMonitoring() {
+        if (healthCheckTask != null) {
+            healthCheckTask.cancel(false);
+            healthCheckTask = null;
+            logger.info("Stopped KMS health monitoring");
+        }
+    }
+
+    /**
+     * Periodic health check that attempts to recover blocked indices by trying to load their keys.
+     * For each index in the failure tracker with blocks applied:
+     * 1. Attempts to load the key for that specific index
+     * 2. If successful, removes blocks and clears failure state
+     * 3. If still failing, keeps blocks and continues monitoring
+     * 
+     * This runs on a single thread and checks all blocked indices managed by this cache.
+     * The thread automatically stops when all indices have been recovered.
+     */
+    private void checkKmsHealthAndRecover() {
+        try {
+            // Get snapshot of blocked indices (only those we blocked)
+            Set<String> blockedIndices = new HashSet<>(failureTracker.keySet());
+
+            if (blockedIndices.isEmpty()) {
+                stopHealthMonitoring();
+                return;
+            }
+
+            logger.info("Checking KMS health for {} crypto indices with blocks", blockedIndices.size());
+
+            // Check each index individually (different keys!)
+            for (String indexUuid : blockedIndices) {
+                FailureState state = failureTracker.get(indexUuid);
+                if (state == null || !state.indexClosed) {
+                    continue; // Not blocked by us
+                }
+
+                try {
+                    // Get resolver for THIS specific index
+                    KeyIvResolver resolver = IndexKeyResolverRegistry.getResolver(indexUuid);
+                    if (resolver == null) {
+                        // Index deleted, clean up
+                        failureTracker.remove(indexUuid);
+                        logger.info("Removed deleted index from failure tracker: {}", indexUuid);
+                        continue;
+                    }
+
+                    // Try to load THIS index's specific key
+                    Key key = ((DefaultKeyIvResolver) resolver).loadKeyFromMasterKeyProvider();
+
+                    // Success for THIS index! Remove its blocks
+                    if (hasBlocks(indexUuid)) {
+                        removeBlocks(indexUuid);
+                        logger.info("Removed blocks from recovered index: {}", indexUuid);
+                    }
+                    failureTracker.remove(indexUuid);
+
+                } catch (Exception e) {
+                    // This index's key still unavailable, continue monitoring
+                    logger.debug("Key still unavailable for index {}: {}", indexUuid, e.getMessage());
+                }
+            }
+
+            // Stop monitoring if no more blocked indices
+            if (failureTracker.isEmpty() || failureTracker.values().stream().noneMatch(s -> s.indexClosed)) {
+                stopHealthMonitoring();
+            }
+
+        } catch (Exception e) {
+            logger.error("Error during KMS health check", e);
+            // Don't stop monitoring on error, continue trying
+        }
+    }
+
+    /**
      * Resets the singleton instance.
      * This method is primarily for testing purposes.
      */
     public static synchronized void reset() {
         if (INSTANCE != null) {
             INSTANCE.clear();
+            // Shutdown health check executor
+            if (INSTANCE.healthCheckExecutor != null) {
+                INSTANCE.stopHealthMonitoring();
+                INSTANCE.healthCheckExecutor.shutdownNow();
+            }
             INSTANCE = null;
         }
     }
