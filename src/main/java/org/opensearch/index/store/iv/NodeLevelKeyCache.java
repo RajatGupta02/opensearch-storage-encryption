@@ -20,6 +20,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.action.admin.cluster.reroute.ClusterRerouteRequest;
 import org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
@@ -555,11 +556,33 @@ public class NodeLevelKeyCache {
     }
 
     /**
+     * Triggers cluster reroute with retry_failed to recover shards that failed 
+     * due to unavailable encryption keys. This allows RED indices to automatically
+     * recover once keys become available again.
+     * 
+     * @param recoveredCount number of indices recovered
+     */
+    private void triggerShardRetry(int recoveredCount) {
+        try {
+            ClusterRerouteRequest request = new ClusterRerouteRequest();
+            request.setRetryFailed(true);
+
+            client.admin().cluster().reroute(request).actionGet();
+
+            logger.info("Triggered shard retry for {} recovered indices", recoveredCount);
+        } catch (Exception e) {
+            logger.warn("Failed to trigger shard retry: {}", e.getMessage());
+            // Non-fatal - shards will recover on next allocation round
+        }
+    }
+
+    /**
      * Periodic health check that attempts to recover blocked indices by trying to load their keys.
      * For each index in the failure tracker with blocks applied:
      * 1. Attempts to load the key for that specific index
      * 2. If successful, removes blocks and clears failure state
      * 3. If still failing, keeps blocks and continues monitoring
+     * 4. After all checks, triggers shard retry to recover RED indices
      * 
      * This runs on a single thread and checks all blocked indices managed by this cache.
      * The thread automatically stops when all indices have been recovered.
@@ -575,6 +598,8 @@ public class NodeLevelKeyCache {
             }
 
             logger.info("Checking KMS health for {} crypto indices with blocks", blockedIndices.size());
+
+            int recoveredCount = 0;
 
             // Check each index individually (different keys!)
             for (String indexUuid : blockedIndices) {
@@ -602,11 +627,17 @@ public class NodeLevelKeyCache {
                         logger.info("Removed blocks from recovered index: {}", indexUuid);
                     }
                     failureTracker.remove(indexUuid);
+                    recoveredCount++;
 
                 } catch (Exception e) {
                     // This index's key still unavailable, continue monitoring
                     logger.debug("Key still unavailable for index {}: {}", indexUuid, e.getMessage());
                 }
+            }
+
+            // After removing blocks, trigger shard retry to recover RED indices
+            if (recoveredCount > 0) {
+                triggerShardRetry(recoveredCount);
             }
 
             // Stop monitoring if no more blocked indices
