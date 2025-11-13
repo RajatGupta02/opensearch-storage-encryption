@@ -172,6 +172,21 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
             Property.NodeScope
         );
 
+    /**
+     * Multiplier for cache expiration timeout.
+     * Expiration timeout = refresh_interval * expiry_multiplier
+     * Default is 3 (meaning keys expire after 3 consecutive refresh failures).
+     * Minimum value is 1.
+     * This setting applies globally to all indices.
+     */
+    public static final Setting<Integer> NODE_KEY_EXPIRY_MULTIPLIER_SETTING = Setting
+        .intSetting(
+            "node.store.crypto.key_expiry_multiplier",
+            3,      // default: 3x the refresh interval
+            1,      // minimum: at least 1x
+            Property.NodeScope
+        );
+
     MasterKeyProvider getKeyProvider(IndexSettings indexSettings) {
         final String KEY_PROVIDER = indexSettings.getValue(INDEX_KEY_PROVIDER_SETTING);
 

@@ -69,6 +69,7 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
                 CryptoDirectoryFactory.INDEX_KMS_ARN_SETTING,
                 CryptoDirectoryFactory.INDEX_KMS_ENC_CTX_SETTING,
                 CryptoDirectoryFactory.NODE_KEY_REFRESH_INTERVAL_SECS_SETTING,
+                CryptoDirectoryFactory.NODE_KEY_EXPIRY_MULTIPLIER_SETTING,
                 PoolSizeCalculator.NODE_POOL_SIZE_PERCENTAGE_SETTING,
                 PoolSizeCalculator.NODE_POOL_TO_CACHE_RATIO_SETTING,
                 PoolSizeCalculator.NODE_WARMUP_PERCENTAGE_SETTING
@@ -112,7 +113,7 @@ public class CryptoDirectoryPlugin extends Plugin implements IndexStorePlugin, E
         MetricsRegistry metricsRegistry
     ) {
         sharedPoolResources = CryptoDirectoryFactory.initializeSharedPool(environment.settings());
-        NodeLevelKeyCache.initialize(environment.settings());
+        NodeLevelKeyCache.initialize(environment.settings(), client, clusterService);
         CryptoMetricsService.initialize(metricsRegistry);
 
         return Collections.emptyList();

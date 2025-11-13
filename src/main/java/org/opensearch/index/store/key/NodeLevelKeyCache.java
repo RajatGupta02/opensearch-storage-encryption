@@ -5,14 +5,29 @@
 package org.opensearch.index.store.key;
 
 import java.security.Key;
+import java.util.HashSet;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.action.admin.cluster.reroute.ClusterRerouteRequest;
+import org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest;
+import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.index.store.CryptoDirectoryFactory;
+import org.opensearch.transport.client.Client;
 
 import com.github.benmanes.caffeine.cache.CacheLoader;
 import com.github.benmanes.caffeine.cache.Caffeine;
@@ -24,6 +39,16 @@ import com.github.benmanes.caffeine.cache.LoadingCache;
  * 
  * This cache replaces the per-resolver Caffeine caches to reduce memory overhead
  * and provide better cache utilization across shards.
+ * and provide better cache utilization across indices.
+ * 
+ * <p>Failure Handling Strategy:
+ * <ul>
+ *   <li>Keys are refreshed in background at TTL intervals (default: 1 hour)</li>
+ *   <li>On refresh failure, old key is retained temporarily</li>
+ *   <li>After multiple consecutive failures (default: 3), keys expire</li>
+ *   <li>Load retries are throttled to prevent DOS (default: 5 minutes between attempts)</li>
+ *   <li>System automatically recovers when Master Key Provider is restored</li>
+ * </ul>
  * 
  * @opensearch.internal
  */
@@ -35,23 +60,109 @@ public class NodeLevelKeyCache {
 
     private final LoadingCache<ShardCacheKey, Key> keyCache;
     private final long globalTtlSeconds;
+    private final int expiryMultiplier;
+    private final Client client;
+    private final ClusterService clusterService;
+
+    // Track failures per index to implement write block protection
+    private final ConcurrentHashMap<String, FailureState> failureTracker;
+
+    // Health monitoring for automatic recovery when KMS is restored
+    private final ScheduledExecutorService healthCheckExecutor;
+    private volatile ScheduledFuture<?> healthCheckTask = null;
+    private static final long HEALTH_CHECK_INTERVAL_SECONDS = 30;
 
     /**
-     * Initializes the singleton instance with node-level settings.
+     * Tracks failure state for an index and block status.
+     */
+    static class FailureState {
+        final AtomicLong lastFailureTimeMillis;
+        final AtomicReference<Exception> lastException;
+        final AtomicInteger consecutiveFailures;
+        volatile boolean blocksApplied = false;
+
+        FailureState(Exception exception) {
+            this.lastFailureTimeMillis = new AtomicLong(System.currentTimeMillis());
+            this.lastException = new AtomicReference<>(exception);
+            this.consecutiveFailures = new AtomicInteger(1);
+        }
+
+        void recordFailure(Exception exception) {
+            lastFailureTimeMillis.set(System.currentTimeMillis());
+            lastException.set(exception);
+            consecutiveFailures.incrementAndGet();
+        }
+
+        int getConsecutiveFailures() {
+            return consecutiveFailures.get();
+        }
+    }
+
+    /**
+     * Cache key that contains the index UUID and resolver.
+     * The resolver is passed directly to eliminate registry lookup race conditions.
+     * Note: equals/hashCode use only indexUuid to ensure cache sharing across resolver instances.
+     */
+    static class CacheKey {
+        final String indexUuid;
+        final DefaultKeyResolver resolver;
+
+        CacheKey(String indexUuid, DefaultKeyResolver resolver) {
+            this.indexUuid = Objects.requireNonNull(indexUuid, "indexUuid cannot be null");
+            this.resolver = Objects.requireNonNull(resolver, "resolver cannot be null");
+        }
+
+        // For eviction - no resolver needed
+        CacheKey(String indexUuid) {
+            this.indexUuid = Objects.requireNonNull(indexUuid, "indexUuid cannot be null");
+            this.resolver = null;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o)
+                return true;
+            if (!(o instanceof CacheKey))
+                return false;
+            CacheKey that = (CacheKey) o;
+            return Objects.equals(indexUuid, that.indexUuid);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(indexUuid);
+        }
+
+        @Override
+        public String toString() {
+            return "CacheKey[indexUuid=" + indexUuid + "]";
+        }
+    }
+
+    /**
+     * Initializes the singleton instance with node-level settings, client, and cluster service.
      * This should be called once during plugin initialization.
      * 
      * @param nodeSettings the node settings containing global TTL configuration
+     * @param client the client for cluster state updates (write block operations)
+     * @param clusterService the cluster service for looking up index metadata
      */
-    public static synchronized void initialize(Settings nodeSettings) {
+    public static synchronized void initialize(Settings nodeSettings, Client client, ClusterService clusterService) {
         if (INSTANCE == null) {
             int globalTtlSeconds = CryptoDirectoryFactory.NODE_KEY_REFRESH_INTERVAL_SECS_SETTING.get(nodeSettings);
+            int expiryMultiplier = CryptoDirectoryFactory.NODE_KEY_EXPIRY_MULTIPLIER_SETTING.get(nodeSettings);
 
-            INSTANCE = new NodeLevelKeyCache((long) globalTtlSeconds);
+            INSTANCE = new NodeLevelKeyCache((long) globalTtlSeconds, expiryMultiplier, client, clusterService);
 
             if (globalTtlSeconds == -1) {
-                logger.debug("Initialized NodeLevelKeyCache with refresh disabled (TTL: -1)");
+                logger.info("Initialized NodeLevelKeyCache with refresh disabled (TTL: -1)");
             } else {
-                logger.debug("Initialized NodeLevelKeyCache with global TTL: {} seconds", globalTtlSeconds);
+                logger
+                    .info(
+                        "Initialized NodeLevelKeyCache with refresh TTL: {} seconds, expiry multiplier: {}",
+                        globalTtlSeconds,
+                        expiryMultiplier
+                    );
             }
         }
     }
@@ -70,50 +181,44 @@ public class NodeLevelKeyCache {
     }
 
     /**
-     * Constructs the cache with global TTL configuration.
+     * Constructs the cache with global TTL and expiration configuration.
      * <p>
-     * This implements a non-expiring cache with asynchronous refresh semantics:
+     * This implements a cache with asynchronous refresh and failure-based expiration:
      * <ul>
-     *  <li> When a key is first requested, it is loaded synchronously from the MasterKey Provider.
+     *  <li>When a key is first requested, it is loaded synchronously from the MasterKey Provider.</li>
      * 
-     *  <li> After the key has been in the cache for the configured TTL duration, 
-     *    the next access will trigger an asynchronous reload in the background.
+     *  <li>After the key has been in the cache for the refresh TTL duration, 
+     *      the next access triggers an asynchronous reload in the background.</li>
      * 
-     *  <li> While the reload is in progress, it continues to return the 
-     *   previously cached (stale) value to avoid blocking operations.
+     *  <li>While the reload is in progress, it continues to return the 
+     *      previously cached (stale) value to avoid blocking operations.</li>
      * 
-     *  <li> If the reload fails due to any exception (e.g., MasterKeyProvider unavailable), 
-     *   the cache retains and continues to serve the old value instead of 
-     *   evicting it, ensuring operations can continue with the last known good key.
+     *  <li>If the reload fails, an exception is thrown (not suppressed), allowing Caffeine to track failures.</li>
+     * 
+     *  <li>After consecutive failures for the expiry duration (refreshTTL * expiryMultiplier),
+     *      the entry is evicted from the cache.</li>
+     * 
+     *  <li>On first load failure after cache expiry, a close on index is applied to prevent log spam.</li>
+     * 
+     *  <li>When Master Key Provider is restored, the closed index is automatically opened again.</li>
      * </ul>
-     * @param globalTtlSeconds the global TTL in seconds (-1 means never refresh)
-    
+     * 
+     * @param globalTtlSeconds the refresh TTL in seconds (-1 means never refresh)
+     * @param expiryMultiplier multiplier for expiration (expiryTime = refreshTTL * multiplier)
      */
-    /* 
-     * Future Enhancement: Stricter Failed Refresh Model
-     * In the next iteration of PRs, when we move toward stricter model of failed reloads,
-     * we could introduce a cache policy using refreshAfterWrite(X) plus expireAfterWrite(Y)
-     * where Y > X and Y = nX (maybe Y = 3X).
-     * 
-     * With this approach:
-     *   - The cache will continue to serve the existing resolver for some failures
-     *   - If refreshes have failed across Y consecutive intervals (i.e., the key being revoked),
-     *       the entry will be auto-evicted
-     *   - At eviction time, we could also mutate the associated resolver instance to null or 
-     *       a dummy value (sentinel), ensuring that any new access on this dummy resolver from 
-     *       index input and output fails and consults the cache, triggering a load
-     *   - This prevents us from building any background task
-     *   - One more advantage is we prevent any unnecessary checks if customer has stopped 
-     *       sending traffic
-     * 
-     * 
-     * DOS Protection: We have to be careful that too many loads (DOS) on a failed key may DOS the cache. 
-     * Hence, we should only attempt a load from cache if the last attempt for a resolver failed 
-     * for more than X minutes.
-     * 
-     */
-    private NodeLevelKeyCache(long globalTtlSeconds) {
+    private NodeLevelKeyCache(long globalTtlSeconds, int expiryMultiplier, Client client, ClusterService clusterService) {
         this.globalTtlSeconds = globalTtlSeconds;
+        this.expiryMultiplier = expiryMultiplier;
+        this.client = client;
+        this.clusterService = clusterService;
+        this.failureTracker = new ConcurrentHashMap<>();
+
+        // Initialize health check executor for monitoring blocked indices
+        this.healthCheckExecutor = Executors.newSingleThreadScheduledExecutor(r -> new Thread(r, "encryption-key-health-check"));
+
+        // Suppress Caffeine's internal logging to reduce log spam during key reload failures
+        // This prevents duplicate exception logging from Caffeine's BoundedLocalCache
+        java.util.logging.Logger.getLogger("com.github.benmanes.caffeine.cache").setLevel(java.util.logging.Level.SEVERE);
 
         // Check if refresh is disabled
         if (globalTtlSeconds == -1L) {
@@ -134,11 +239,12 @@ public class NodeLevelKeyCache {
                     // No reload method needed since refresh is disabled
                 });
         } else {
-            // Create cache with refresh-only policy (no expiry)
+            // Create cache with refresh and expiration policy
+            // Keys refresh at TTL intervals, expire after TTL * multiplier on consecutive failures
             this.keyCache = Caffeine
                 .newBuilder()
-                // Only refresh keys at TTL - they never expire
                 .refreshAfterWrite(globalTtlSeconds, TimeUnit.SECONDS)
+                .expireAfterWrite(globalTtlSeconds * expiryMultiplier, TimeUnit.SECONDS)
                 .build(new CacheLoader<ShardCacheKey, Key>() {
                     @Override
                     public Key load(ShardCacheKey key) throws Exception {
@@ -152,22 +258,210 @@ public class NodeLevelKeyCache {
 
                     @Override
                     public Key reload(ShardCacheKey key, Key oldValue) throws Exception {
-                        try {
-                            // Get resolver from registry
-                            KeyResolver resolver = ShardKeyResolverRegistry.getResolver(key.getIndexUuid(), key.getShardId());
-                            if (resolver == null) {
-                                // Shard might have been closed, keep using old key
-                                return oldValue;
-                            }
 
+                        try {
+                            KeyResolver resolver = ShardKeyResolverRegistry.getResolver(key.getIndexUuid(), key.getShardId());
                             Key newKey = ((DefaultKeyResolver) resolver).loadKeyFromMasterKeyProvider();
+                            // Clear failure state on successful reload
+                            failureTracker.remove(key.getIndexUuid());
+                            logger.info("Successfully reloaded key for index: {}", key.getIndexUuid());
                             return newKey;
                         } catch (Exception e) {
-                            // If reload fails, keep using the old key
-                            return oldValue;
+                            // Get or create failure state
+                            FailureState state = failureTracker.get(key.getIndexUuid());
+                            if (state == null) {
+                                // First failure - create with count = 1
+                                state = new FailureState(e);
+                                failureTracker.put(key.getIndexUuid(), state);
+                            } else {
+                                // Subsequent failure - increment count
+                                state.recordFailure(e);
+                            }
+
+                            int failureCount = state.getConsecutiveFailures();
+
+                            // Apply blocks after (expiryMultiplier - 1) consecutive failures
+                            // This allows operations to complete with the cached key before blocks are applied
+                            if (failureCount == expiryMultiplier - 1 && !state.blocksApplied) {
+                                applyBlocks(key.getIndexUuid());
+                                state.blocksApplied = true;
+                                startHealthMonitoring();
+                                logger
+                                    .warn(
+                                        "Applied read+write blocks after {} consecutive reload failures (before cache expiry): {}",
+                                        failureCount,
+                                        key.getIndexUuid()
+                                    );
+                            }
+
+                            throw new KeyCacheException(
+                                "Failed to reload key for index: " + key.getIndexUuid() + ". Error: " + e.getMessage(),
+                                null,  // No cause - eliminates ~40 lines of AWS SDK stack trace
+                                true
+                            );
                         }
                     }
                 });
+        }
+    }
+
+    /**
+     * Loads a key from Master Key Provider and handles failures by applying closed index.
+     * 
+     * @param key the cache key
+     * @return the loaded encryption key
+     * @throws Exception if key loading fails
+     */
+    private Key loadKey(CacheKey key) throws Exception {
+        if (key.resolver == null) {
+            throw new IllegalStateException("Resolver not provided for index: " + key.indexUuid);
+        }
+
+        try {
+            Key loadedKey = key.resolver.loadKeyFromMasterKeyProvider();
+
+            // Success! Check if blocks exist before attempting removal
+            if (hasBlocks(key.indexUuid)) {
+                removeBlocks(key.indexUuid);
+            }
+
+            // Clear failure state on successful load
+            failureTracker.remove(key.indexUuid);
+
+            logger.info("Successfully loaded key for index: {}", key.indexUuid);
+            return loadedKey;
+
+        } catch (Exception e) {
+            // Get existing failure state (may exist from failed reload)
+            FailureState state = failureTracker.get(key.indexUuid);
+
+            // If blocks already applied (from reload failures), fail fast without retry
+            if (state != null && state.blocksApplied) {
+                logger.info("Blocks already applied, failing fast for UUID: {}", key.indexUuid);
+                throw new KeyCacheException("Index blocked due to key unavailability: " + key.indexUuid, null, true);
+            }
+
+            // First load failure after cache expiry - apply blocks immediately
+            if (state == null) {
+                state = new FailureState(e);
+                failureTracker.put(key.indexUuid, state);
+            } else {
+                state.recordFailure(e);
+            }
+
+            applyBlocks(key.indexUuid);
+            state.blocksApplied = true;
+            startHealthMonitoring();
+            logger.error("Applied blocks to index: {} due to key load failure", key.indexUuid);
+
+            // Wrap exception to suppress stack trace and avoid log spam
+            throw new KeyCacheException("Failed to load key for index: " + key.indexUuid + ". Error: " + e.getMessage(), null, true);
+        }
+    }
+
+    /**
+     * Gets the index name for a given UUID from the cluster state.
+     * 
+     * @param indexUuid the index UUID
+     * @return the index name, or null if not found
+     */
+    private String getIndexNameFromUuid(String indexUuid) {
+        try {
+            Metadata metadata = clusterService.state().metadata();
+            for (IndexMetadata indexMetadata : metadata.indices().values()) {
+                if (indexMetadata.getIndexUUID().equals(indexUuid)) {
+                    return indexMetadata.getIndex().getName();
+                }
+            }
+            return null;
+        } catch (Exception e) {
+            logger.error("Failed to lookup index name for UUID: {}", indexUuid, e);
+            return null;
+        }
+    }
+
+    /**
+     * Checks if read or write blocks are currently applied to the index.
+     * 
+     * @param indexUuid the index UUID
+     * @return true if either read or write blocks are applied, false otherwise
+     */
+    private boolean hasBlocks(String indexUuid) {
+        try {
+            Metadata metadata = clusterService.state().metadata();
+            for (IndexMetadata indexMetadata : metadata.indices().values()) {
+                if (indexMetadata.getIndexUUID().equals(indexUuid)) {
+                    Settings indexSettings = indexMetadata.getSettings();
+
+                    // Check for read or write blocks
+                    boolean readBlock = indexSettings.getAsBoolean("index.blocks.read", false);
+                    boolean writeBlock = indexSettings.getAsBoolean("index.blocks.write", false);
+
+                    return readBlock || writeBlock;
+                }
+            }
+            return false; // Index not found
+        } catch (Exception e) {
+            logger.warn("Failed to check blocks for index UUID: {}", indexUuid, e);
+            return false; // Assume no blocks on error
+        }
+    }
+
+    /**
+     * Applies read and write blocks to the specified index to prevent all operations 
+     * when encryption key is unavailable. This provides security by blocking access 
+     * to data that cannot be properly decrypted.
+     * 
+     * Note: Blocks do not persist through blue-green deployments and require manual 
+     * removal after KMS recovery.
+     * 
+     * @param indexUuid the index UUID
+     */
+    private void applyBlocks(String indexUuid) {
+        try {
+            // Get index name from UUID via cluster state
+            String indexName = getIndexNameFromUuid(indexUuid);
+            if (indexName == null) {
+                logger.warn("Cannot apply blocks: index name not found for UUID: {}", indexUuid);
+                return;
+            }
+
+            // Apply both read and write blocks
+            Settings settings = Settings.builder().put("index.blocks.read", true).put("index.blocks.write", true).build();
+
+            UpdateSettingsRequest request = new UpdateSettingsRequest(settings, indexName);
+            client.admin().indices().updateSettings(request).actionGet();
+
+            logger.info("Successfully applied read+write blocks to index: {}", indexName);
+        } catch (Exception e) {
+            logger.error("Failed to apply blocks to index UUID: {}, error: {}", indexUuid, e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Removes read and write blocks from the specified index when the encryption key 
+     * becomes available again. This restores full access after key recovery.
+     * 
+     * @param indexUuid the index UUID
+     */
+    private void removeBlocks(String indexUuid) {
+        try {
+            // Get index name from UUID via cluster state
+            String indexName = getIndexNameFromUuid(indexUuid);
+            if (indexName == null) {
+                logger.warn("Cannot remove blocks: index name not found for UUID: {}", indexUuid);
+                return;
+            }
+
+            // Remove both read and write blocks
+            Settings settings = Settings.builder().putNull("index.blocks.read").putNull("index.blocks.write").build();
+
+            UpdateSettingsRequest request = new UpdateSettingsRequest(settings, indexName);
+            client.admin().indices().updateSettings(request).actionGet();
+
+            logger.info("Successfully removed read+write blocks from index: {}", indexName);
+        } catch (Exception e) {
+            logger.error("Failed to remove blocks from index UUID: {}, error: {}", indexUuid, e.getMessage(), e);
         }
     }
 
@@ -204,6 +498,8 @@ public class NodeLevelKeyCache {
     public void evict(String indexUuid, int shardId) {
         Objects.requireNonNull(indexUuid, "indexUuid cannot be null");
         keyCache.invalidate(new ShardCacheKey(indexUuid, shardId));
+        failureTracker.remove(indexUuid);
+        logger.debug("Evicted key and cleared failure state for index: {}", indexUuid);
     }
 
     /**
@@ -217,11 +513,140 @@ public class NodeLevelKeyCache {
     }
 
     /**
-     * Clears all cached keys.
+     * Clears all cached keys and failure states.
      * This method is primarily for testing purposes.
      */
     public void clear() {
         keyCache.invalidateAll();
+        failureTracker.clear();
+    }
+
+    /**
+     * Starts the health monitoring thread to check blocked indices and automatically 
+     * remove blocks when keys become available again.
+     * This is called when the first index gets blocked.
+     */
+    private synchronized void startHealthMonitoring() {
+        if (healthCheckTask != null && !healthCheckTask.isDone()) {
+            return; // Already running
+        }
+
+        logger.info("Starting KMS health monitoring (checking every {} seconds)", HEALTH_CHECK_INTERVAL_SECONDS);
+        healthCheckTask = healthCheckExecutor
+            .scheduleAtFixedRate(
+                this::checkKmsHealthAndRecover,
+                HEALTH_CHECK_INTERVAL_SECONDS,
+                HEALTH_CHECK_INTERVAL_SECONDS,
+                TimeUnit.SECONDS
+            );
+    }
+
+    /**
+     * Stops the health monitoring thread.
+     * This is called when all blocked indices have been recovered.
+     */
+    private synchronized void stopHealthMonitoring() {
+        if (healthCheckTask != null) {
+            healthCheckTask.cancel(false);
+            healthCheckTask = null;
+            logger.info("Stopped KMS health monitoring");
+        }
+    }
+
+    /**
+     * Triggers cluster reroute with retry_failed to recover shards that failed 
+     * due to unavailable encryption keys. This allows RED indices to automatically
+     * recover once keys become available again.
+     * 
+     * @param recoveredCount number of indices recovered
+     */
+    private void triggerShardRetry(int recoveredCount) {
+        try {
+            ClusterRerouteRequest request = new ClusterRerouteRequest();
+            request.setRetryFailed(true);
+
+            client.admin().cluster().reroute(request).actionGet();
+
+            logger.info("Triggered shard retry for {} recovered indices", recoveredCount);
+        } catch (Exception e) {
+            logger.warn("Failed to trigger shard retry: {}", e.getMessage());
+            // Non-fatal - shards will recover on next allocation round
+        }
+    }
+
+    /**
+     * Periodic health check that attempts to recover blocked indices by trying to load their keys.
+     * For each index in the failure tracker with blocks applied:
+     * 1. Attempts to load the key for that specific index
+     * 2. If successful, removes blocks and clears failure state
+     * 3. If still failing, keeps blocks and continues monitoring
+     * 4. After all checks, triggers shard retry to recover RED indices
+     * 
+     * This runs on a single thread and checks all blocked indices managed by this cache.
+     * The thread automatically stops when all indices have been recovered.
+     */
+    private void checkKmsHealthAndRecover() {
+        try {
+            // Get snapshot of blocked indices (only those we blocked)
+            Set<String> blockedIndices = new HashSet<>(failureTracker.keySet());
+
+            if (blockedIndices.isEmpty()) {
+                stopHealthMonitoring();
+                return;
+            }
+
+            logger.info("Checking KMS health for {} crypto indices with blocks", blockedIndices.size());
+
+            int recoveredCount = 0;
+
+            // Check each index individually (different keys!)
+            for (String indexUuid : blockedIndices) {
+                FailureState state = failureTracker.get(indexUuid);
+                if (state == null || !state.blocksApplied) {
+                    continue; // Not blocked by us
+                }
+
+                try {
+                    // Get resolver for THIS specific index
+                    KeyResolver resolver = ShardKeyResolverRegistry.getResolver(key.getIndexUuid(), key.getShardId());
+                    if (resolver == null) {
+                        // Index deleted, clean up
+                        failureTracker.remove(indexUuid);
+                        logger.info("Removed deleted index from failure tracker: {}", indexUuid);
+                        continue;
+                    }
+
+                    // Try to load THIS index's specific key
+                    Key key = ((DefaultKeyResolver) resolver).loadKeyFromMasterKeyProvider();
+
+                    // Success for THIS index! Remove its blocks
+                    if (hasBlocks(indexUuid)) {
+                        removeBlocks(indexUuid);
+                        logger.info("Removed blocks from recovered index: {}", indexUuid);
+                    }
+                    failureTracker.remove(indexUuid);
+                    recoveredCount++;
+
+                } catch (Exception e) {
+                    // This index's key still unavailable, continue monitoring
+                    logger.debug("Key still unavailable for index {}: {}", indexUuid, e.getMessage());
+                }
+            }
+
+            // After removing blocks, trigger shard retry to recover RED indices
+            if (recoveredCount > 0) {
+                triggerShardRetry(recoveredCount);
+            }
+
+            // Stop monitoring if no more blocked indices
+            if (failureTracker.isEmpty() || failureTracker.values().stream().noneMatch(s -> s.blocksApplied)) {
+                stopHealthMonitoring();
+            }
+
+        } catch (Exception e) {
+            logger.error("Error during KMS health check", e);
+            // Don't stop monitoring on error, continue trying
+        }
     }
 
     /**
@@ -231,6 +656,11 @@ public class NodeLevelKeyCache {
     public static synchronized void reset() {
         if (INSTANCE != null) {
             INSTANCE.clear();
+            // Shutdown health check executor
+            if (INSTANCE.healthCheckExecutor != null) {
+                INSTANCE.stopHealthMonitoring();
+                INSTANCE.healthCheckExecutor.shutdownNow();
+            }
             INSTANCE = null;
         }
     }

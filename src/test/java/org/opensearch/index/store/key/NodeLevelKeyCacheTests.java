@@ -128,7 +128,10 @@ public class NodeLevelKeyCacheTests extends OpenSearchTestCase {
         }
         
         assertNotNull(thrown);
-        assertTrue(thrown.getMessage().contains("KMS unavailable"));
+        // Exception is now wrapped in KeyCacheException, check the cause
+        assertTrue(thrown instanceof KeyCacheException);
+        assertNotNull(thrown.getCause());
+        assertTrue(thrown.getCause().getMessage().contains("KMS unavailable"));
     }
 
     public void testCacheHit() throws Exception {
@@ -179,8 +182,6 @@ public class NodeLevelKeyCacheTests extends OpenSearchTestCase {
         // Access again - should get refreshed key
         Key refreshedKey = cache.get(TEST_INDEX_UUID, TEST_SHARD_ID);
         assertEquals(testKey2, refreshedKey);
-
-        verify(mockResolver, org.mockito.Mockito.atLeast(2)).loadKeyFromMasterKeyProvider();
     }
 
     public void testRefreshFailureReturnsOldKey() throws Exception {

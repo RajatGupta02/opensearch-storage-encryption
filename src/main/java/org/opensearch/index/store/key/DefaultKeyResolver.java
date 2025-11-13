@@ -144,11 +144,11 @@ public class DefaultKeyResolver implements KeyResolver {
     @Override
     public Key getDataKey() {
         try {
-            return NodeLevelKeyCache.getInstance().get(indexUuid, shardId);
-        } catch (Exception ex) {
-            throw new RuntimeException("No Node Level Key Cache available for {}", ex);
+            return NodeLevelKeyCache.getInstance().get(indexUuid, this);
+        } catch (Exception e) {
+            // Suppress stack trace to avoid log spam when keys are disabled or unavailable
+            throw new KeyCacheException("Failed to get encryption key for index: " + indexUuid, e, true);
         }
-
     }
 
 }
