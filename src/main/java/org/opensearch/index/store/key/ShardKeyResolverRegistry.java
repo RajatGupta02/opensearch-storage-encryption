@@ -6,6 +6,7 @@ package org.opensearch.index.store.key;
 
 import java.io.IOException;
 import java.security.Provider;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
@@ -147,7 +148,7 @@ public class ShardKeyResolverRegistry {
      * @return any KeyResolver for this index, or null if no shards exist on this node
      */
     public static KeyResolver getAnyResolverForIndex(String indexUuid) {
-        for (java.util.Map.Entry<ShardCacheKey, KeyResolver> entry : resolverCache.entrySet()) {
+        for (Map.Entry<ShardCacheKey, KeyResolver> entry : resolverCache.entrySet()) {
             if (entry.getKey().getIndexUuid().equals(indexUuid)) {
                 return entry.getValue();  // Return first match - all shards share same master key
             }

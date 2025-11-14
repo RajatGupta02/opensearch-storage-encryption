@@ -22,6 +22,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.admin.cluster.reroute.ClusterRerouteRequest;
 import org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest;
+import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.service.ClusterService;
@@ -271,11 +272,6 @@ public class NodeLevelKeyCache {
         try {
             Key loadedKey = ((DefaultKeyResolver) resolver).loadKeyFromMasterKeyProvider();
 
-            // Success! Check if blocks exist before attempting removal
-            if (hasBlocks(key.getIndexUuid())) {
-                removeBlocks(key.getIndexUuid());
-            }
-
             // Clear failure state on successful load
             failureTracker.remove(key.getIndexUuid());
 
@@ -318,7 +314,11 @@ public class NodeLevelKeyCache {
      */
     private String getIndexNameFromUuid(String indexUuid) {
         try {
-            Metadata metadata = clusterService.state().metadata();
+            ClusterState clusterState = clusterService.state();
+            if (clusterState == null) {
+                return null;
+            }
+            Metadata metadata = clusterState.metadata();
             for (IndexMetadata indexMetadata : metadata.indices().values()) {
                 if (indexMetadata.getIndexUUID().equals(indexUuid)) {
                     return indexMetadata.getIndex().getName();
@@ -339,7 +339,11 @@ public class NodeLevelKeyCache {
      */
     private boolean hasBlocks(String indexUuid) {
         try {
-            Metadata metadata = clusterService.state().metadata();
+            ClusterState clusterState = clusterService.state();
+            if (clusterState == null) {
+                return false;
+            }
+            Metadata metadata = clusterState.metadata();
             for (IndexMetadata indexMetadata : metadata.indices().values()) {
                 if (indexMetadata.getIndexUUID().equals(indexUuid)) {
                     Settings indexSettings = indexMetadata.getSettings();
@@ -370,6 +374,10 @@ public class NodeLevelKeyCache {
      */
     private void applyBlocks(String indexUuid) {
         try {
+            if (client == null) {
+                return;
+            }
+
             // Get index name from UUID via cluster state
             String indexName = getIndexNameFromUuid(indexUuid);
             if (indexName == null) {
@@ -397,6 +405,10 @@ public class NodeLevelKeyCache {
      */
     private void removeBlocks(String indexUuid) {
         try {
+            if (client == null) {
+                return;
+            }
+
             // Get index name from UUID via cluster state
             String indexName = getIndexNameFromUuid(indexUuid);
             if (indexName == null) {
@@ -513,6 +525,10 @@ public class NodeLevelKeyCache {
      */
     private void triggerShardRetry(int recoveredCount) {
         try {
+            if (client == null) {
+                return;
+            }
+
             ClusterRerouteRequest request = new ClusterRerouteRequest();
             request.setRetryFailed(true);
 
