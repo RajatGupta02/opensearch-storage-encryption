@@ -99,47 +99,6 @@ public class NodeLevelKeyCache {
     }
 
     /**
-     * Cache key that contains the index UUID and resolver.
-     * The resolver is passed directly to eliminate registry lookup race conditions.
-     * Note: equals/hashCode use only indexUuid to ensure cache sharing across resolver instances.
-     */
-    static class CacheKey {
-        final String indexUuid;
-        final DefaultKeyResolver resolver;
-
-        CacheKey(String indexUuid, DefaultKeyResolver resolver) {
-            this.indexUuid = Objects.requireNonNull(indexUuid, "indexUuid cannot be null");
-            this.resolver = Objects.requireNonNull(resolver, "resolver cannot be null");
-        }
-
-        // For eviction - no resolver needed
-        CacheKey(String indexUuid) {
-            this.indexUuid = Objects.requireNonNull(indexUuid, "indexUuid cannot be null");
-            this.resolver = null;
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            if (this == o)
-                return true;
-            if (!(o instanceof CacheKey))
-                return false;
-            CacheKey that = (CacheKey) o;
-            return Objects.equals(indexUuid, that.indexUuid);
-        }
-
-        @Override
-        public int hashCode() {
-            return Objects.hash(indexUuid);
-        }
-
-        @Override
-        public String toString() {
-            return "CacheKey[indexUuid=" + indexUuid + "]";
-        }
-    }
-
-    /**
      * Initializes the singleton instance with node-level settings, client, and cluster service.
      * This should be called once during plugin initialization.
      * 
@@ -229,12 +188,7 @@ public class NodeLevelKeyCache {
                 .build(new CacheLoader<ShardCacheKey, Key>() {
                     @Override
                     public Key load(ShardCacheKey key) throws Exception {
-                        // Get resolver from registry
-                        KeyResolver resolver = ShardKeyResolverRegistry.getResolver(key.getIndexUuid(), key.getShardId());
-                        if (resolver == null) {
-                            throw new IllegalStateException("No resolver registered for shard: " + key);
-                        }
-                        return ((DefaultKeyResolver) resolver).loadKeyFromMasterKeyProvider();
+                        return loadKey(key);
                     }
                     // No reload method needed since refresh is disabled
                 });
@@ -248,12 +202,7 @@ public class NodeLevelKeyCache {
                 .build(new CacheLoader<ShardCacheKey, Key>() {
                     @Override
                     public Key load(ShardCacheKey key) throws Exception {
-                        // Get resolver from registry
-                        KeyResolver resolver = ShardKeyResolverRegistry.getResolver(key.getIndexUuid(), key.getShardId());
-                        if (resolver == null) {
-                            throw new IllegalStateException("No resolver registered for shard: " + key);
-                        }
-                        return ((DefaultKeyResolver) resolver).loadKeyFromMasterKeyProvider();
+                        return loadKey(key);
                     }
 
                     @Override
@@ -306,56 +255,58 @@ public class NodeLevelKeyCache {
     }
 
     /**
-     * Loads a key from Master Key Provider and handles failures by applying closed index.
+     * Loads a key from Master Key Provider and handles failures by applying blocks.
      * 
-     * @param key the cache key
+     * @param key the shard cache key
      * @return the loaded encryption key
      * @throws Exception if key loading fails
      */
-    private Key loadKey(CacheKey key) throws Exception {
-        if (key.resolver == null) {
-            throw new IllegalStateException("Resolver not provided for index: " + key.indexUuid);
+    private Key loadKey(ShardCacheKey key) throws Exception {
+        // Get resolver from registry
+        KeyResolver resolver = ShardKeyResolverRegistry.getResolver(key.getIndexUuid(), key.getShardId());
+        if (resolver == null) {
+            throw new IllegalStateException("No resolver registered for shard: " + key);
         }
 
         try {
-            Key loadedKey = key.resolver.loadKeyFromMasterKeyProvider();
+            Key loadedKey = ((DefaultKeyResolver) resolver).loadKeyFromMasterKeyProvider();
 
             // Success! Check if blocks exist before attempting removal
-            if (hasBlocks(key.indexUuid)) {
-                removeBlocks(key.indexUuid);
+            if (hasBlocks(key.getIndexUuid())) {
+                removeBlocks(key.getIndexUuid());
             }
 
             // Clear failure state on successful load
-            failureTracker.remove(key.indexUuid);
+            failureTracker.remove(key.getIndexUuid());
 
-            logger.info("Successfully loaded key for index: {}", key.indexUuid);
+            logger.info("Successfully loaded key for index: {}", key.getIndexUuid());
             return loadedKey;
 
         } catch (Exception e) {
             // Get existing failure state (may exist from failed reload)
-            FailureState state = failureTracker.get(key.indexUuid);
+            FailureState state = failureTracker.get(key.getIndexUuid());
 
             // If blocks already applied (from reload failures), fail fast without retry
             if (state != null && state.blocksApplied) {
-                logger.info("Blocks already applied, failing fast for UUID: {}", key.indexUuid);
-                throw new KeyCacheException("Index blocked due to key unavailability: " + key.indexUuid, null, true);
+                logger.info("Blocks already applied, failing fast for UUID: {}", key.getIndexUuid());
+                throw new KeyCacheException("Index blocked due to key unavailability: " + key.getIndexUuid(), null, true);
             }
 
             // First load failure after cache expiry - apply blocks immediately
             if (state == null) {
                 state = new FailureState(e);
-                failureTracker.put(key.indexUuid, state);
+                failureTracker.put(key.getIndexUuid(), state);
             } else {
                 state.recordFailure(e);
             }
 
-            applyBlocks(key.indexUuid);
+            applyBlocks(key.getIndexUuid());
             state.blocksApplied = true;
             startHealthMonitoring();
-            logger.error("Applied blocks to index: {} due to key load failure", key.indexUuid);
+            logger.error("Applied blocks to index: {} due to key load failure", key.getIndexUuid());
 
             // Wrap exception to suppress stack trace and avoid log spam
-            throw new KeyCacheException("Failed to load key for index: " + key.indexUuid + ". Error: " + e.getMessage(), null, true);
+            throw new KeyCacheException("Failed to load key for index: " + key.getIndexUuid() + ". Error: " + e.getMessage(), null, true);
         }
     }
 
@@ -607,8 +558,8 @@ public class NodeLevelKeyCache {
                 }
 
                 try {
-                    // Get resolver for THIS specific index
-                    KeyResolver resolver = ShardKeyResolverRegistry.getResolver(key.getIndexUuid(), key.getShardId());
+                    // Get resolver for THIS specific index (use shard 0 as representative - all shards use same master key)
+                    KeyResolver resolver = ShardKeyResolverRegistry.getResolver(indexUuid, 0);
                     if (resolver == null) {
                         // Index deleted, clean up
                         failureTracker.remove(indexUuid);
