@@ -558,10 +558,10 @@ public class NodeLevelKeyCache {
                 }
 
                 try {
-                    // Get resolver for THIS specific index (use shard 0 as representative - all shards use same master key)
-                    KeyResolver resolver = ShardKeyResolverRegistry.getResolver(indexUuid, 0);
+                    // Get any resolver for THIS specific index (all shards share the same master key)
+                    KeyResolver resolver = ShardKeyResolverRegistry.getAnyResolverForIndex(indexUuid);
                     if (resolver == null) {
-                        // Index deleted, clean up
+                        // Index deleted or no shards on this node, clean up
                         failureTracker.remove(indexUuid);
                         logger.info("Removed deleted index from failure tracker: {}", indexUuid);
                         continue;
