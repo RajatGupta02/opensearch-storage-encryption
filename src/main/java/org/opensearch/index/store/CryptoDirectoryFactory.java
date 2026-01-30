@@ -44,6 +44,8 @@ import org.opensearch.index.store.key.KeyResolver;
 import org.opensearch.index.store.key.ShardKeyResolverRegistry;
 import org.opensearch.index.store.kms_encryption_context.EncryptionContextResolver;
 import org.opensearch.index.store.kms_encryption_context.EncryptionContextResolverFactory;
+import org.opensearch.index.store.metrics.CryptoMetricsService;
+import org.opensearch.index.store.metrics.ErrorType;
 import org.opensearch.index.store.niofs.CryptoNIOFSDirectory;
 import org.opensearch.index.store.pool.PoolBuilder;
 import org.opensearch.index.store.read_ahead.Worker;
@@ -274,11 +276,15 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
      */
     @Override
     public Directory newDirectory(IndexSettings indexSettings, ShardPath path) throws IOException {
-        final Path location = path.resolveIndex();
-        final LockFactory lockFactory = indexSettings.getValue(org.opensearch.index.store.FsDirectoryFactory.INDEX_LOCK_FACTOR_SETTING);
-        Files.createDirectories(location);
-        int shardId = path.getShardId().getId();
-        return newFSDirectory(location, lockFactory, indexSettings, shardId);
+        try {
+            final Path location = path.resolveIndex();
+            final LockFactory lockFactory = indexSettings.getValue(org.opensearch.index.store.FsDirectoryFactory.INDEX_LOCK_FACTOR_SETTING);
+            Files.createDirectories(location);
+            return newFSDirectory(location, lockFactory, indexSettings);
+        } catch (Exception e) {
+            CryptoMetricsService.getInstance().recordError(ErrorType.DIRECTORY_CREATION_ERROR);
+            throw e;
+        }
     }
 
     /**
@@ -368,8 +374,11 @@ public class CryptoDirectoryFactory implements IndexStorePlugin.DirectoryFactory
      * @return the concrete implementation of the encrypted directory based on store type
      * @throws IOException if directory creation fails
      */
-    protected Directory newFSDirectory(Path location, LockFactory lockFactory, IndexSettings indexSettings, int shardId)
-        throws IOException {
+    @Override
+    public Directory newFSDirectory(Path location, LockFactory lockFactory, IndexSettings indexSettings) throws IOException {
+        // Extract shardId from path structure: .../indices/{index-uuid}/{shard-id}/index/
+        // location.getParent() gives us the shard directory
+        int shardId = Integer.parseInt(location.getParent().getFileName().toString());
         final Provider provider = Security.getProvider(DEFAULT_CRYPTO_PROVIDER);
 
         // Use index-level key resolver - store keys at index level

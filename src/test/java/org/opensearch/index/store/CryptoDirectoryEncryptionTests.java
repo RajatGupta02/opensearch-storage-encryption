@@ -49,16 +49,19 @@ import org.opensearch.index.store.key.MasterKeyHealthMonitor;
 import org.opensearch.index.store.key.NodeLevelKeyCache;
 import org.opensearch.index.store.key.ShardCacheKey;
 import org.opensearch.index.store.key.ShardKeyResolverRegistry;
+import org.opensearch.index.store.metrics.CryptoMetricsService;
 import org.opensearch.index.store.niofs.CryptoNIOFSDirectory;
 import org.opensearch.index.store.pool.MemorySegmentPool;
 import org.opensearch.index.store.pool.Pool;
 import org.opensearch.index.store.read_ahead.Worker;
 import org.opensearch.index.store.read_ahead.impl.QueuingWorker;
+import org.opensearch.telemetry.metrics.MetricsRegistry;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.transport.client.AdminClient;
 import org.opensearch.transport.client.Client;
 import org.opensearch.transport.client.IndicesAdminClient;
 
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 
@@ -66,6 +69,7 @@ import com.github.benmanes.caffeine.cache.Caffeine;
  * Tests to verify that directory-level encryption properly isolates data between different keys.
  * This validates the core security property: data encrypted with Key A cannot be read with Key B.
  */
+@ThreadLeakFilters(filters = CaffeineThreadLeakFilter.class)
 public class CryptoDirectoryEncryptionTests extends OpenSearchTestCase {
 
     private static final Logger logger = LogManager.getLogger(CryptoDirectoryEncryptionTests.class);
@@ -106,6 +110,9 @@ public class CryptoDirectoryEncryptionTests extends OpenSearchTestCase {
 
         // Clear the ShardKeyResolverRegistry cache before each test
         ShardKeyResolverRegistry.clearCache();
+
+        // Initialize with a mock metrics registry for testing
+        CryptoMetricsService.initialize(mock(MetricsRegistry.class));
 
         // Initialize NodeLevelKeyCache with test settings
         Settings nodeSettings = Settings
