@@ -249,44 +249,31 @@ public class HybridCryptoDirectoryTests {
     }
 
     @Test
-    public void testOpenInputRoutesToBufferPoolForMetadataFiles() throws Exception {
-        // .si files now route to buffer pool for encryption like all other files
-        IndexInput mockInput = mock(IndexInput.class);
-        when(mockInput.length()).thenReturn(1L);
-        when(bufferPoolDirectory.openInput(eq("test.si"), any(IOContext.class))).thenReturn(mockInput);
-
-        // Use nioExtensions without "si" since .si files are no longer special-cased
-        Set<String> extensionsWithoutSi = Set.of("cfe", "fnm", "fdx", "fdt", "pos", "pay", "nvm", "dvm", "tvx", "tvd", "liv", "dii", "vem");
+    public void testOpenInputRoutesToNIOWithEncryptionForSiFiles() throws Exception {
+        // .si is in nioExtensions → routes to NIO (CryptoNIOFSDirectory)
+        // With bypass removed, NIO path now encrypts .si files
         HybridCryptoDirectory hybridDir = new HybridCryptoDirectory(
-            lockFactory, bufferPoolDirectory, provider, keyResolver, encryptionMetadataCache, extensionsWithoutSi
+            lockFactory,
+            bufferPoolDirectory,
+            provider,
+            keyResolver,
+            encryptionMetadataCache,
+            nioExtensions
         );
 
         try {
+            // Write a .si file through the encrypted NIO path
+            IndexOutput output = hybridDir.createOutput("test.si", IOContext.DEFAULT);
+            output.writeByte((byte) 42);
+            output.close();
+
+            // Read it back — should go through encrypted NIO, not buffer pool
             IndexInput input = hybridDir.openInput("test.si", IOContext.DEFAULT);
             assertNotNull(input);
+            assertEquals((byte) 42, input.readByte());
             input.close();
-            verify(bufferPoolDirectory).openInput(eq("test.si"), any(IOContext.class));
-        } finally {
-            hybridDir.close();
-        }
-    }
 
-    @Test
-    public void testOpenInputRoutesToBufferPoolForSegmentsFile() throws Exception {
-        // segments_ files now route to buffer pool for encryption like all other files
-        IndexInput mockInput = mock(IndexInput.class);
-        when(mockInput.length()).thenReturn(1L);
-        when(bufferPoolDirectory.openInput(eq("segments_1"), any(IOContext.class))).thenReturn(mockInput);
-
-        HybridCryptoDirectory hybridDir = new HybridCryptoDirectory(
-            lockFactory, bufferPoolDirectory, provider, keyResolver, encryptionMetadataCache, nioExtensions
-        );
-
-        try {
-            IndexInput input = hybridDir.openInput("segments_1", IOContext.DEFAULT);
-            assertNotNull(input);
-            input.close();
-            verify(bufferPoolDirectory).openInput(eq("segments_1"), any(IOContext.class));
+            verify(bufferPoolDirectory, never()).openInput(eq("test.si"), any(IOContext.class));
         } finally {
             hybridDir.close();
         }
