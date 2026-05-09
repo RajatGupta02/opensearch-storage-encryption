@@ -111,6 +111,11 @@ public final class CaffeineBlockCache<T, V> implements BlockCache<T> {
         }
     }
 
+    @Override
+    public void verify(BlockCacheKey key, BlockCacheValue<T> value) {
+        verifyCachedBlock(key, value);
+    }
+
     /**
      * Diagnostic verification: re-read the block fresh from disk and compare bytes
      * against what's in the cache. Logs ERROR with details on mismatch.
