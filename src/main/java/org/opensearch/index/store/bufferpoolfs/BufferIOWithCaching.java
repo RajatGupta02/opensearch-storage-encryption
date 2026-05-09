@@ -112,15 +112,10 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
         private int totalFrames = 0;
         private boolean isClosed = false;
 
-        // Partial block tracking for final block caching.
-        // partialBlockContiguous: true only when the buffer has been filled from offset 0
-        // contiguously. False once a write starts at non-zero blockOffset within the current
-        // block (which leaves stale bytes in [0..blockOffset)). When false, we must NOT
-        // cache the partial buffer because the prefix would be stale data.
+        // Partial block tracking for final block caching
         private long lastCachedBlockOffset = -1;
         private byte[] partialBlockBuffer = new byte[CACHE_BLOCK_SIZE];
         private int partialBlockLength = 0;
-        private boolean partialBlockContiguous = true;
 
         EncryptedOutputStream(
             OutputStream os,
@@ -292,21 +287,14 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
                 // Partial block - accumulate for potential final block caching
                 // Check if this is a new block or continuation of current partial block
                 if (blockAlignedOffset != lastCachedBlockOffset || partialBlockLength == 0) {
-                    // Starting a new partial block. The buffer is contiguous only if the
-                    // first write starts at offset 0; otherwise [0..blockOffset) holds stale
-                    // bytes from a previously-tracked partial block.
+                    // Starting a new partial block
                     lastCachedBlockOffset = blockAlignedOffset;
                     partialBlockLength = 0;
-                    partialBlockContiguous = (blockOffset == 0);
                 }
 
-                // Skip accumulation entirely if the block is non-contiguous; the prefix
-                // would be stale and there's no safe way to materialize it without reading
-                // from disk. Reads will load this block from disk on demand.
-                if (partialBlockContiguous) {
-                    MemorySegment.copy(sourceData, sourceOffset, MemorySegment.ofArray(partialBlockBuffer), blockOffset, chunkLen);
-                    partialBlockLength = Math.max(partialBlockLength, blockOffset + chunkLen);
-                }
+                // Accumulate into partial buffer
+                MemorySegment.copy(sourceData, sourceOffset, MemorySegment.ofArray(partialBlockBuffer), blockOffset, chunkLen);
+                partialBlockLength = Math.max(partialBlockLength, blockOffset + chunkLen);
             }
         }
 
@@ -416,11 +404,6 @@ public final class BufferIOWithCaching extends OutputStreamIndexOutput {
                 return;
             }
             if (partialBlockLength == 0 || lastCachedBlockOffset < 0 || streamOffset <= 0) {
-                return;
-            }
-            // If the partial block is non-contiguous, [0..blockOffset) holds stale bytes
-            // and we cannot safely cache it. Reads will load from disk instead.
-            if (!partialBlockContiguous) {
                 return;
             }
 

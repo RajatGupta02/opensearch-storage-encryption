@@ -208,19 +208,8 @@ public class CryptoDirectIOBlockLoader implements BlockLoader<RefCountedMemorySe
                     encryptionMetadataCache
                 );
 
-            // Trim to content length: anything past contentLength is encryption footer
-            // bytes that got "decrypted" as if they were content — comparing those is
-            // meaningless because the cache also doesn't have valid bytes there.
-            long fileSize = java.nio.file.Files.size(filePath);
-            long contentLength = fileSize - footer.getFooterLength();
-            long blockContentEnd = contentLength - blockOffset;
-            if (blockContentEnd <= 0) {
-                return new byte[0];
-            }
-            int validLen = (int) Math.min(bytesRead, blockContentEnd);
-
-            byte[] out = new byte[validLen];
-            MemorySegment.copy(readBytes, 0, MemorySegment.ofArray(out), 0, validLen);
+            byte[] out = new byte[(int) bytesRead];
+            MemorySegment.copy(readBytes, 0, MemorySegment.ofArray(out), 0, bytesRead);
             return out;
         }
     }

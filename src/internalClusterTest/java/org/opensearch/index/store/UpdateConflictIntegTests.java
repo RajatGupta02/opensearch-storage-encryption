@@ -83,7 +83,7 @@ public class UpdateConflictIntegTests extends OpenSearchIntegTestCase {
             .put("node.store.crypto.pool_size_percentage", 0.05)
             .put("node.store.crypto.warmup_percentage", 0.0)
             .put("node.store.crypto.cache_to_pool_ratio", 0.8)
-            // Default write_cache_enabled=true to test the fix
+            .put("node.store.crypto.write_cache_enabled", false)
             .build();
     }
 

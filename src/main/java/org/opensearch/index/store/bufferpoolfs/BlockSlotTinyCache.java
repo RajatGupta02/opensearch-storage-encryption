@@ -168,13 +168,6 @@ public class BlockSlotTinyCache {
                         final int expectedGen = (int) (stamp >>> 32);
                         if (v.tryPin()) {
                             if (v.value().getGeneration() == expectedGen) {
-                                // Diagnostic: verify L1 hit against fresh disk read
-                                FileBlockCacheKey verifyKey = slotKeys[slotIdx];
-                                if (verifyKey == null || verifyKey.fileOffset() != blockOff) {
-                                    verifyKey = new FileBlockCacheKey(path, blockOff);
-                                    slotKeys[slotIdx] = verifyKey;
-                                }
-                                cache.verify(verifyKey, v);
                                 if (hitHolder != null)
                                     hitHolder.setWasCacheHit(true);
                                 return v;

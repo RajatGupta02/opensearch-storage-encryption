@@ -32,22 +32,12 @@ public interface BlockCache<T> {
 
     /**
      * Returns the block, loading it via {@code BlockLoader} if absent.
-     *
+     * 
      * @param key the cache key identifying the block
      * @return the block value, either from cache or newly loaded
      * @throws IOException if the block cannot be loaded
      */
     BlockCacheValue<T> getOrLoad(BlockCacheKey key) throws IOException;
-
-    /**
-     * Diagnostic-only: verify a cached value matches a fresh disk read.
-     * Called from L1 hit paths so corruption can be detected even when the cache
-     * hit is served without going through {@link #get} / {@link #getOrLoad}.
-     * Default no-op for caches that don't support verification.
-     */
-    default void verify(BlockCacheKey key, BlockCacheValue<T> value) {
-        // no-op
-    }
 
     /**
      * Asynchronously load the block into the cache if not present.
