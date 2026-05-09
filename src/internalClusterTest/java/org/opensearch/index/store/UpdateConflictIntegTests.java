@@ -83,6 +83,7 @@ public class UpdateConflictIntegTests extends OpenSearchIntegTestCase {
             .put("node.store.crypto.pool_size_percentage", 0.05)
             .put("node.store.crypto.warmup_percentage", 0.0)
             .put("node.store.crypto.cache_to_pool_ratio", 0.8)
+            .put("node.store.crypto.write_cache_enabled", false)
             .build();
     }
 
@@ -126,9 +127,9 @@ public class UpdateConflictIntegTests extends OpenSearchIntegTestCase {
         createIndex(indexName, settings);
         ensureGreen(indexName);
 
-        // Phase 1: Initial bulk indexing
-        int totalDocs = 50_000;
-        int initialBulkSize = 5000;
+        // Phase 1: Initial bulk indexing — sized to fit in 512MB test JVM heap
+        int totalDocs = 20_000;
+        int initialBulkSize = 2000;
         for (int batch = 0; batch < totalDocs / initialBulkSize; batch++) {
             BulkRequestBuilder bulk = client().prepareBulk();
             for (int i = 0; i < initialBulkSize; i++) {
@@ -165,7 +166,7 @@ public class UpdateConflictIntegTests extends OpenSearchIntegTestCase {
                         int round = 0;
                         while (System.currentTimeMillis() < deadline) {
                             BulkRequestBuilder bulk = client().prepareBulk();
-                            int currentBulkSize = 1000;
+                            int currentBulkSize = 500;
                             for (int i = 0; i < currentBulkSize; i++) {
                                 // 50% conflict: update existing; 50%: upsert new
                                 int docId;

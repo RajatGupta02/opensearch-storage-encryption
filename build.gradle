@@ -107,6 +107,8 @@ test {
 tasks.named('internalClusterTest').configure {
     systemProperty 'tests.security.manager', 'false'
     systemProperty 'java.security.policy', 'test.policy'
+    minHeapSize = '2g'
+    maxHeapSize = '2g'
     testLogging {
         events "passed", "skipped", "failed"
         showStandardStreams = true

@@ -37,6 +37,14 @@ import com.github.benmanes.caffeine.cache.Cache;
 public final class CaffeineBlockCache<T, V> implements BlockCache<T> {
     private static final Logger LOGGER = LogManager.getLogger(CaffeineBlockCache.class);
 
+    /**
+     * Diagnostic: when -Dcrypto.verify_cached_blocks=true, every cache read also re-reads
+     * the same block fresh from disk and compares plaintext bytes. Logs ERROR on mismatch
+     * with the cache key, offsets, and the differing bytes so we can pinpoint corruption
+     * source (cache poisoning vs. read/decrypt path).
+     */
+    private static final boolean VERIFY_CACHED_BLOCKS = Boolean.getBoolean("crypto.verify_cached_blocks");
+
     private final Cache<BlockCacheKey, BlockCacheValue<T>> cache;
     private final BlockLoader<V> blockLoader;
 
@@ -54,7 +62,11 @@ public final class CaffeineBlockCache<T, V> implements BlockCache<T> {
 
     @Override
     public BlockCacheValue<T> get(BlockCacheKey key) {
-        return cache.getIfPresent(key);
+        BlockCacheValue<T> v = cache.getIfPresent(key);
+        if (v != null) {
+            verifyCachedBlock(key, v);
+        }
+        return v;
     }
 
     /**
@@ -89,12 +101,91 @@ public final class CaffeineBlockCache<T, V> implements BlockCache<T> {
                 throw new IOException("Failed to load block for key: " + key);
             }
 
+            verifyCachedBlock(key, value);
+
             return value;
         } catch (UncheckedIOException e) {
             throw e;
         } catch (RuntimeException e) {
             throw new IOException("Failed to load block for key: " + key, e);
         }
+    }
+
+    /**
+     * Diagnostic verification: re-read the block fresh from disk and compare bytes
+     * against what's in the cache. Logs ERROR with details on mismatch.
+     *
+     * <p>Pinning is required to safely read the cached segment's contents. We pin
+     * before reading, copy out bytes, then unpin. The fresh read uses a separate
+     * disk + decrypt path that bypasses both caches.
+     */
+    @SuppressWarnings("unchecked")
+    private void verifyCachedBlock(BlockCacheKey key, BlockCacheValue<T> value) {
+        if (!VERIFY_CACHED_BLOCKS) return;
+        if (!(key instanceof FileBlockCacheKey fk)) return;
+        try {
+            byte[] fresh = blockLoader.loadFreshForVerification(fk.filePath(), fk.offset());
+            if (fresh == null || fresh.length == 0) return;
+
+            // Read cached bytes (need to pin to safely access)
+            if (!value.tryPin()) return;
+            byte[] cached;
+            try {
+                T held = value.value();
+                if (!(held instanceof org.opensearch.index.store.block.RefCountedMemorySegment rcms)) {
+                    return;
+                }
+                int len = Math.min(fresh.length, rcms.length());
+                cached = new byte[len];
+                java.lang.foreign.MemorySegment.copy(rcms.segment(), 0, java.lang.foreign.MemorySegment.ofArray(cached), 0, len);
+            } finally {
+                value.unpin();
+            }
+
+            int mismatchAt = -1;
+            int compareLen = Math.min(cached.length, fresh.length);
+            for (int i = 0; i < compareLen; i++) {
+                if (cached[i] != fresh[i]) {
+                    mismatchAt = i;
+                    break;
+                }
+            }
+
+            if (mismatchAt >= 0 || cached.length != fresh.length) {
+                LOGGER
+                    .error(
+                        "CACHE_VERIFY MISMATCH key={} cachedLen={} freshLen={} firstMismatchAt={} cachedHex[0..32]={} freshHex[0..32]={}",
+                        key,
+                        cached.length,
+                        fresh.length,
+                        mismatchAt,
+                        toHex(cached, 0, Math.min(32, cached.length)),
+                        toHex(fresh, 0, Math.min(32, fresh.length))
+                    );
+                if (mismatchAt >= 0) {
+                    int from = Math.max(0, mismatchAt - 8);
+                    int to = Math.min(compareLen, mismatchAt + 24);
+                    LOGGER
+                        .error(
+                            "CACHE_VERIFY context around mismatch[{}..{}] cached={} fresh={}",
+                            from,
+                            to,
+                            toHex(cached, from, to - from),
+                            toHex(fresh, from, to - from)
+                        );
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.warn("CACHE_VERIFY error verifying key={}: {}", key, e.toString());
+        }
+    }
+
+    private static String toHex(byte[] bytes, int off, int len) {
+        StringBuilder sb = new StringBuilder(len * 2);
+        for (int i = off; i < off + len && i < bytes.length; i++) {
+            sb.append(String.format("%02x", bytes[i]));
+        }
+        return sb.toString();
     }
 
     @Override

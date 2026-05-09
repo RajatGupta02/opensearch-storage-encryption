@@ -133,4 +133,15 @@ public interface BlockLoader<T> {
         }
         return result[0];
     }
+
+    /**
+     * Diagnostic-only: returns plaintext bytes for the given block by reading + decrypting
+     * directly from disk, WITHOUT using the segment pool. Returns null if not supported.
+     *
+     * <p>Used to verify cached blocks against fresh disk reads. Default implementation returns
+     * null (verification not supported by this loader).
+     */
+    default byte[] loadFreshForVerification(java.nio.file.Path filePath, long blockOffset) throws Exception {
+        return null;
+    }
 }

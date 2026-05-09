@@ -172,6 +172,48 @@ public class CryptoDirectIOBlockLoader implements BlockLoader<RefCountedMemorySe
         }
     }
 
+    /**
+     * Diagnostic-only: reads + decrypts a single block fresh from disk WITHOUT using
+     * the pool (uses transient arena allocation that's freed on return). Returns the
+     * decrypted bytes. Used to verify cached blocks against fresh disk reads to detect
+     * cache poisoning vs. decryption errors.
+     *
+     * <p>Allocates on the heap, not the segment pool, so it does not affect pool pressure.
+     */
+    public byte[] loadFreshForVerification(Path filePath, long blockOffset) throws Exception {
+        String normalizedPath = filePath.toAbsolutePath().normalize().toString();
+        try (Arena arena = Arena.ofConfined(); RefCountedChannel ref = fileChannelCache.acquire(normalizedPath)) {
+            MemorySegment readBytes = directIOReadAligned(ref.channel(), filePath, blockOffset, CACHE_BLOCK_SIZE, arena);
+            long bytesRead = readBytes.byteSize();
+            if (bytesRead == 0) {
+                return new byte[0];
+            }
+
+            byte[] masterKey = keyResolver.getDataKey().getEncoded();
+            EncryptionFooter footer = readFooterFromDisk(normalizedPath, filePath, masterKey);
+            var metadata = encryptionMetadataCache.getOrLoadMetadata(normalizedPath, footer, masterKey);
+            byte[] messageId = metadata.getFooter().getMessageId();
+            byte[] fileKey = metadata.getFileKey();
+
+            MemorySegmentDecryptor
+                .decryptInPlaceFrameBased(
+                    readBytes.address(),
+                    bytesRead,
+                    fileKey,
+                    masterKey,
+                    messageId,
+                    EncryptionMetadataTrailer.DEFAULT_FRAME_SIZE,
+                    blockOffset,
+                    normalizedPath,
+                    encryptionMetadataCache
+                );
+
+            byte[] out = new byte[(int) bytesRead];
+            MemorySegment.copy(readBytes, 0, MemorySegment.ofArray(out), 0, bytesRead);
+            return out;
+        }
+    }
+
     private EncryptionFooter readFooterFromDisk(String normalizedPath, Path filePath, byte[] masterKey) throws IOException {
         // Check cache first for fast path
         EncryptionFooter cachedFooter = encryptionMetadataCache.getFooter(normalizedPath);
